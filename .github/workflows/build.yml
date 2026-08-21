@@ -72,8 +72,8 @@ jobs:
                   applicationId = "com.asistan.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 3
-                  versionName = "3.0-AI"
+                  versionCode = 4
+                  versionName = "4.0-AI"
               }
 
               compileOptions {
@@ -109,7 +109,6 @@ jobs:
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <!-- İnternet İzni (Yapay Zeka İçin) -->
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.READ_CALL_LOG" />
               <uses-permission android:name="android.permission.READ_SMS" />
@@ -209,9 +208,9 @@ jobs:
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.core.content.ContextCompat
-          import androidx.lifecycle.lifecycleScope
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
@@ -342,52 +341,59 @@ jobs:
                   if (apiKey.isBlank()) {
                       return@withContext "Lütfen önce 'Ayarlar' sekmesinden Gemini API anahtarınızı girin."
                   }
-                  try {
-                      val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$apiKey")
-                      val conn = url.openConnection() as HttpURLConnection
-                      conn.requestMethod = "POST"
-                      conn.setRequestProperty("Content-Type", "application/json; utf-8")
-                      conn.doOutput = true
 
-                      val jsonBody = JSONObject().apply {
-                          val contents = JSONArray().apply {
-                              val item = JSONObject().apply {
-                                  val parts = JSONArray().apply {
-                                      put(JSONObject().put("text", prompt))
+                  val modelsToTry = listOf("gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-2.5-flash", "gemini-pro")
+                  var lastError = ""
+
+                  for (model in modelsToTry) {
+                      try {
+                          val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey")
+                          val conn = url.openConnection() as HttpURLConnection
+                          conn.requestMethod = "POST"
+                          conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                          conn.doOutput = true
+
+                          val jsonBody = JSONObject().apply {
+                              val contents = JSONArray().apply {
+                                  val item = JSONObject().apply {
+                                      val parts = JSONArray().apply {
+                                          put(JSONObject().put("text", prompt))
+                                      }
+                                      put("parts", parts)
                                   }
-                                  put("parts", parts)
+                                  put(item)
                               }
-                              put(item)
+                              put("contents", contents)
                           }
-                          put("contents", contents)
-                      }
 
-                      OutputStreamWriter(conn.outputStream).use { os ->
-                          os.write(jsonBody.toString())
-                          os.flush()
-                      }
-
-                      val responseCode = conn.responseCode
-                      if (responseCode == 200) {
-                          val responseText = conn.inputStream.bufferedReader().use { it.readText() }
-                          val resJson = JSONObject(responseText)
-                          val candidates = resJson.getJSONArray("candidates")
-                          if (candidates.length() > 0) {
-                              val text = candidates.getJSONObject(0)
-                                  .getJSONObject("content")
-                                  .getJSONArray("parts")
-                                  .getJSONObject(0)
-                                  .getString("text")
-                              return@withContext text
+                          OutputStreamWriter(conn.outputStream).use { os ->
+                              os.write(jsonBody.toString())
+                              os.flush()
                           }
-                      } else {
-                          val errorText = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                          return@withContext "API Hatası ($responseCode): $errorText"
+
+                          val responseCode = conn.responseCode
+                          if (responseCode == 200) {
+                              val responseText = conn.inputStream.bufferedReader().use { it.readText() }
+                              val resJson = JSONObject(responseText)
+                              val candidates = resJson.getJSONArray("candidates")
+                              if (candidates.length() > 0) {
+                                  return@withContext candidates.getJSONObject(0)
+                                      .getJSONObject("content")
+                                      .getJSONArray("parts")
+                                      .getJSONObject(0)
+                                      .getString("text")
+                              }
+                          } else {
+                              val errorText = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                              lastError = "Model $model: $errorText"
+                              if (responseCode == 404) continue
+                              else return@withContext "API Hatası ($responseCode): $errorText"
+                          }
+                      } catch (e: Exception) {
+                          lastError = "Hata: ${e.message}"
                       }
-                  } catch (e: Exception) {
-                      return@withContext "Bağlantı Hatası: ${e.message}"
                   }
-                  return@withContext "Bir yanıt alınamadı."
+                  return@withContext "Yapay zeka modellerine ulaşılamadı. Son hata: $lastError"
               }
           }
 
@@ -405,7 +411,7 @@ jobs:
               callGemini: suspend (String) -> String
           ) {
               var selectedTab by remember { mutableStateOf(0) }
-              val tabs = listOf("🧠 AI Brifing", "💬 AI Sohbet", "📞 Aramalar", "✉️ Mesajlar", "⚙️ Ayarlar")
+              val tabs = listOf("Brifing", "Sohbet", "Arama", "Mesaj", "Ayarlar")
 
               var alarmState by remember { mutableStateOf(Pair(true, "Yükleniyor...")) }
               var callsList by remember { mutableStateOf<List<CallInfo>>(emptyList()) }
@@ -428,7 +434,14 @@ jobs:
                               NavigationBarItem(
                                   selected = selectedTab == index,
                                   onClick = { selectedTab = index },
-                                  label = { Text(title, style = MaterialTheme.typography.labelSmall) },
+                                  label = {
+                                      Text(
+                                          title,
+                                          style = MaterialTheme.typography.labelSmall,
+                                          maxLines = 1,
+                                          overflow = TextOverflow.Ellipsis
+                                      )
+                                  },
                                   icon = { }
                               )
                           }
@@ -469,7 +482,7 @@ jobs:
                       val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number})" }
                       val notesText = notificationsList.joinToString("\n") { "[${it.type}] ${it.title}: ${it.text}" }
                       val prompt = """
-                          Sen kullanıcının kişisel asistanısın. Aşağıda kullanıcının telefonundaki güncel veriler var:
+                          Sen kullanıcının kişisel akıllı asistanısın. Aşağıda kullanıcının telefonundaki güncel veriler var:
                           
                           ALARM DURUMU: ${alarmState.second}
                           CEVAPSIZ ARAMALAR:
@@ -479,8 +492,8 @@ jobs:
                           $notesText
                           
                           GÖREVİN:
-                          1. Kullanıcıya kibar ve profesyonel bir yönetici özeti (Executive Briefing) çıkar.
-                          2. Varsa acil cevaplanması gereken mailleri veya geri dönülmesi gereken kişileri vurgula.
+                          1. Kullanıcıya samimi, kibar ve profesyonel bir günlük özet çıkar.
+                          2. Varsa acil cevaplanması gereken mailleri veya aranması gereken kişileri vurgula.
                           3. Hafta içi alarmı yoksa uyar.
                           4. Madde madde yapılacaklar listesi sun.
                       """.trimIndent()
@@ -492,7 +505,7 @@ jobs:
 
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Text("🧠 AI Kişisel Yönetici Brifingi", style = MaterialTheme.typography.headlineSmall)
+                      Text("🧠 AI Günlük Yönetici Brifingi", style = MaterialTheme.typography.headlineSmall)
                       Spacer(modifier = Modifier.height(12.dp))
                   }
                   item {
@@ -581,7 +594,7 @@ jobs:
                       TextField(
                           value = userInput,
                           onValueChange = { userInput = it },
-                          placeholder = { Text("Asistana bir soru sorun...") },
+                          placeholder = { Text("Bir şey sorun...") },
                           modifier = Modifier.weight(1f)
                       )
                       Spacer(modifier = Modifier.width(8.dp))
@@ -606,7 +619,7 @@ jobs:
                                           $notesText
                                           
                                           Kullanıcının sorusu: $userText
-                                          Yanıtını kibar, net ve doğrudan ver.
+                                          Yanıtını samimi, net ve doğrudan Türkçe ver.
                                       """.trimIndent()
 
                                       val reply = callGemini(fullPrompt)
