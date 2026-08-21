@@ -72,13 +72,21 @@ jobs:
                   applicationId = "com.asistan.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 5
-                  versionName = "5.0-Ultimate-AI"
+                  versionCode = 6
+                  versionName = "6.0-Full-Mail-AI"
               }
 
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                      excludes += "/META-INF/NOTICE.md"
+                      excludes += "/META-INF/LICENSE.md"
+                  }
               }
 
               buildFeatures {
@@ -103,6 +111,10 @@ jobs:
               implementation("androidx.compose.material3:material3")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
               implementation("androidx.work:work-runtime-ktx:2.9.0")
+              
+              // Tam E-Posta ve Ek Okuma Kütüphanesi (JavaMail)
+              implementation("com.sun.mail:android-mail:1.6.7")
+              implementation("com.sun.mail:android-activation:1.6.7")
           }
           EOF
 
@@ -110,7 +122,6 @@ jobs:
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <!-- Gerekli Tüm Sistem ve Donanım İzinleri -->
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.READ_CALL_LOG" />
@@ -169,8 +180,6 @@ jobs:
                       if (title.isBlank() && text.isBlank()) return
 
                       val appType = when {
-                          pkg.contains("gm") || pkg.contains("email") -> "✉️ Mail"
-                          pkg.contains("outlook") -> "💼 Outlook"
                           pkg.contains("whatsapp") -> "💬 WhatsApp"
                           pkg.contains("mms") || pkg.contains("sms") -> "📱 SMS"
                           else -> null
@@ -184,47 +193,6 @@ jobs:
                           prefs.edit().putString("bildirimler_listesi", "$entry|||$current").apply()
                       }
                   }
-              }
-          }
-          EOF
-
-          # AssistantWorker.kt (Arka Plan Kontrolcüsü)
-          cat << 'EOF' > app/src/main/java/com/asistan/app/AssistantWorker.kt
-          package com.asistan.app
-
-          import android.app.NotificationChannel
-          import android.app.NotificationManager
-          import android.content.Context
-          import android.os.Build
-          import androidx.core.app.NotificationCompat
-          import androidx.work.CoroutineWorker
-          import androidx.work.WorkerParameters
-
-          class AssistantWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
-              override suspend fun doWork(): Result {
-                  val prefs = applicationContext.getSharedPreferences("asistan_veriler", Context.MODE_PRIVATE)
-                  val notifCount = prefs.getString("bildirimler_listesi", "")?.split("|||")?.filter { it.isNotBlank() }?.size ?: 0
-                  
-                  if (notifCount > 0) {
-                      showNotification("🤖 Asistan Hatırlatması", "İncelemeniz gereken yeni mail veya mesaj bildirimleri var.")
-                  }
-                  return Result.success()
-              }
-
-              private fun showNotification(title: String, message: String) {
-                  val manager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                  val channelId = "asistan_alerts"
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val channel = NotificationChannel(channelId, "Asistan Bildirimleri", NotificationManager.IMPORTANCE_DEFAULT)
-                      manager.createNotificationChannel(channel)
-                  }
-                  val notification = NotificationCompat.Builder(applicationContext, channelId)
-                      .setContentTitle(title)
-                      .setContentText(message)
-                      .setSmallIcon(android.R.drawable.ic_dialog_info)
-                      .setAutoCancel(true)
-                      .build()
-                  manager.notify(1001, notification)
               }
           }
           EOF
@@ -263,8 +231,6 @@ jobs:
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.core.content.ContextCompat
-          import androidx.work.PeriodicWorkRequestBuilder
-          import androidx.work.WorkManager
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
@@ -273,12 +239,20 @@ jobs:
           import java.io.OutputStreamWriter
           import java.net.HttpURLConnection
           import java.net.URL
+          import java.text.SimpleDateFormat
           import java.util.Calendar
           import java.util.Locale
-          import java.util.concurrent.TimeUnit
+          import java.util.Properties
+          import javax.mail.BodyPart
+          import javax.mail.Folder
+          import javax.mail.Multipart
+          import javax.mail.Part
+          import javax.mail.Session
+          import javax.mail.internet.MimeMessage
 
           data class CallInfo(val name: String, val number: String, val date: String)
           data class NotificationItem(val time: String, val type: String, val title: String, val text: String)
+          data class FullEmailItem(val sender: String, val subject: String, val body: String, val attachments: List<String>, val date: String)
           data class ChatMessage(val sender: String, val text: String)
 
           class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
@@ -303,7 +277,6 @@ jobs:
                   super.onCreate(savedInstanceState)
                   tts = TextToSpeech(this, this)
                   requestAppPermissions()
-                  setupBackgroundWorker()
 
                   setContent {
                       MaterialTheme {
@@ -312,6 +285,7 @@ jobs:
                                   onRefreshAlarms = { checkAlarmStatus() },
                                   onRefreshCalls = { getUnreturnedCalls() },
                                   onRefreshNotifications = { getStoredNotifications() },
+                                  onFetchEmails = { fetchFullEmails() },
                                   onCallNumber = { num ->
                                       startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num")))
                                   },
@@ -322,6 +296,8 @@ jobs:
                                   onClearData = { clearAllData() },
                                   getApiKey = { getSavedApiKey() },
                                   saveApiKey = { key -> saveApiKeyToPrefs(key) },
+                                  getEmailConfig = { getSavedEmailConfig() },
+                                  saveEmailConfig = { email, pass -> saveEmailConfigToPrefs(email, pass) },
                                   callGemini = { prompt -> askGemini(prompt) },
                                   onSpeakText = { text -> speakOut(text) },
                                   onStopSpeaking = { stopSpeaking() },
@@ -374,11 +350,6 @@ jobs:
                       putExtra(CalendarContract.Events.DESCRIPTION, description)
                   }
                   startActivity(intent)
-              }
-
-              private fun setupBackgroundWorker() {
-                  val workRequest = PeriodicWorkRequestBuilder<AssistantWorker>(3, TimeUnit.HOURS).build()
-                  WorkManager.getInstance(this).enqueue(workRequest)
               }
 
               private fun requestAppPermissions() {
@@ -446,6 +417,89 @@ jobs:
                           NotificationItem(parts[0], parts[1], parts[2], parts[3])
                       } else null
                   }
+              }
+
+              private fun saveEmailConfigToPrefs(email: String, pass: String) {
+                  getSharedPreferences("asistan_veriler", MODE_PRIVATE).edit()
+                      .putString("email_user", email.trim())
+                      .putString("email_pass", pass.trim())
+                      .apply()
+              }
+
+              private fun getSavedEmailConfig(): Pair<String, String> {
+                  val prefs = getSharedPreferences("asistan_veriler", MODE_PRIVATE)
+                  return Pair(prefs.getString("email_user", "") ?: "", prefs.getString("email_pass", "") ?: "")
+              }
+
+              private suspend fun fetchFullEmails(): List<FullEmailItem> = withContext(Dispatchers.IO) {
+                  val (emailUser, emailPass) = getSavedEmailConfig()
+                  if (emailUser.isBlank() || emailPass.isBlank()) return@withContext emptyList()
+
+                  val emailList = mutableListOf<FullEmailItem>()
+                  try {
+                      val host = when {
+                          emailUser.contains("@gmail") -> "imap.gmail.com"
+                          emailUser.contains("@outlook") || emailUser.contains("@hotmail") -> "outlook.office365.com"
+                          emailUser.contains("@yandex") -> "imap.yandex.com"
+                          else -> "imap.gmail.com"
+                      }
+
+                      val props = Properties().apply {
+                          put("mail.store.protocol", "imaps")
+                          put("mail.imaps.host", host)
+                          put("mail.imaps.port", "993")
+                          put("mail.imaps.ssl.enable", "true")
+                      }
+
+                      val session = Session.getInstance(props)
+                      val store = session.getStore("imaps")
+                      store.connect(host, emailUser, emailPass)
+
+                      val inbox = store.getFolder("INBOX")
+                      inbox.open(Folder.READ_ONLY)
+
+                      val messageCount = inbox.messageCount
+                      val start = maxOf(1, messageCount - 9)
+                      val messages = inbox.getMessages(start, messageCount)
+
+                      for (msg in messages.reversed()) {
+                          val from = msg.from?.joinToString { it.toString() } ?: "Bilinmeyen"
+                          val subject = msg.subject ?: "Konusuz"
+                          val date = msg.sentDate?.let { SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()).format(it) } ?: ""
+                          val attachments = mutableListOf<String>()
+                          val body = getTextAndAttachmentsFromMessage(msg, attachments)
+
+                          emailList.add(FullEmailItem(from, subject, body.take(800), attachments, date))
+                      }
+
+                      inbox.close(false)
+                      store.close()
+                  } catch (e: Exception) {
+                      emailList.add(FullEmailItem("Hata", "Mail Çekilemedi", "Detay: ${e.message}", emptyList(), ""))
+                  }
+                  return@withContext emailList
+              }
+
+              private fun getTextAndAttachmentsFromMessage(part: Part, attachments: MutableList<String>): String {
+                  if (part.isMimeType("text/plain")) {
+                      return part.content as String
+                  } else if (part.isMimeType("text/html")) {
+                      val html = part.content as String
+                      return android.text.Html.fromHtml(html, android.text.Html.FROM_HTML_MODE_LEGACY).toString()
+                  } else if (part.isMimeType("multipart/*")) {
+                      val mp = part.content as Multipart
+                      val sb = StringBuilder()
+                      for (i in 0 until mp.count) {
+                          val bodyPart = mp.getBodyPart(i)
+                          if (Part.ATTACHMENT.equals(bodyPart.disposition, ignoreCase = true) || bodyPart.fileName != null) {
+                              attachments.add(bodyPart.fileName ?: "Ekli Dosya")
+                          } else {
+                              sb.append(getTextAndAttachmentsFromMessage(bodyPart, attachments))
+                          }
+                      }
+                      return sb.toString()
+                  }
+                  return ""
               }
 
               private fun saveApiKeyToPrefs(key: String) {
@@ -532,12 +586,15 @@ jobs:
               onRefreshAlarms: () -> Pair<Boolean, String>,
               onRefreshCalls: () -> List<CallInfo>,
               onRefreshNotifications: () -> List<NotificationItem>,
+              onFetchEmails: suspend () -> List<FullEmailItem>,
               onCallNumber: (String) -> Unit,
               onRequestPermissions: () -> Unit,
               onOpenNotificationSettings: () -> Unit,
               onClearData: () -> Unit,
               getApiKey: () -> String,
               saveApiKey: (String) -> Unit,
+              getEmailConfig: () -> Pair<String, String>,
+              saveEmailConfig: (String, String) -> Unit,
               callGemini: suspend (String) -> String,
               onSpeakText: (String) -> Unit,
               onStopSpeaking: () -> Unit,
@@ -546,16 +603,22 @@ jobs:
               onAddToCalendar: (String, String) -> Unit
           ) {
               var selectedTab by remember { mutableStateOf(0) }
-              val tabs = listOf("Brifing", "Sohbet", "Arama", "Mesaj", "Ayarlar")
+              val tabs = listOf("Brifing", "Sohbet", "E-Postalar", "Aramalar", "Ayarlar")
 
               var alarmState by remember { mutableStateOf(Pair(true, "Yükleniyor...")) }
               var callsList by remember { mutableStateOf<List<CallInfo>>(emptyList()) }
               var notificationsList by remember { mutableStateOf<List<NotificationItem>>(emptyList()) }
+              var emailsList by remember { mutableStateOf<List<FullEmailItem>>(emptyList()) }
+
+              val scope = rememberCoroutineScope()
 
               fun refreshAll() {
                   alarmState = onRefreshAlarms()
                   callsList = onRefreshCalls()
                   notificationsList = onRefreshNotifications()
+                  scope.launch {
+                      emailsList = onFetchEmails()
+                  }
               }
 
               LaunchedEffect(Unit) {
@@ -585,11 +648,13 @@ jobs:
               ) { padding ->
                   Box(modifier = Modifier.padding(padding).fillMaxSize()) {
                       when (selectedTab) {
-                          0 -> AiBriefingScreen(alarmState, callsList, notificationsList, callGemini, onRefresh = { refreshAll() }, onSpeakText, onStopSpeaking, onAddToCalendar)
-                          1 -> AiChatScreen(alarmState, callsList, notificationsList, callGemini, onStartVoiceInput)
-                          2 -> CallsScreen(callsList, onCallNumber, onRequestPermissions)
-                          3 -> NotificationsScreen(notificationsList, onOpenNotificationSettings, callGemini, onCopyToClipboard)
-                          4 -> SettingsScreen(getApiKey, saveApiKey, onClearData = {
+                          0 -> AiBriefingScreen(alarmState, callsList, emailsList, notificationsList, callGemini, onRefresh = { refreshAll() }, onSpeakText, onStopSpeaking, onAddToCalendar)
+                          1 -> AiChatScreen(alarmState, callsList, emailsList, notificationsList, callGemini, onStartVoiceInput)
+                          2 -> EmailsScreen(emailsList, onFetchEmails = {
+                              scope.launch { emailsList = onFetchEmails() }
+                          }, callGemini, onCopyToClipboard)
+                          3 -> CallsScreen(callsList, onCallNumber, onRequestPermissions)
+                          4 -> SettingsScreen(getApiKey, saveApiKey, getEmailConfig, saveEmailConfig, onClearData = {
                               onClearData()
                               refreshAll()
                           }, onOpenNotificationSettings, onRequestPermissions)
@@ -602,6 +667,7 @@ jobs:
           fun AiBriefingScreen(
               alarmState: Pair<Boolean, String>,
               callsList: List<CallInfo>,
+              emailsList: List<FullEmailItem>,
               notificationsList: List<NotificationItem>,
               callGemini: suspend (String) -> String,
               onRefresh: () -> Unit,
@@ -609,7 +675,7 @@ jobs:
               onStopSpeaking: () -> Unit,
               onAddToCalendar: (String, String) -> Unit
           ) {
-              var aiSummary by remember { mutableStateOf("Yapay zekadan günlük yönetici brifingi almak için aşağıdaki butona basın.") }
+              var aiSummary by remember { mutableStateOf("Tüm e-postalarınızı, ekli dosyaları ve cevapsız aramaları yapay zekayla analiz etmek için aşağıdaki butona basın.") }
               var isLoading by remember { mutableStateOf(false) }
               var isSpeaking by remember { mutableStateOf(false) }
               val scope = rememberCoroutineScope()
@@ -619,21 +685,25 @@ jobs:
                       isLoading = true
                       onRefresh()
                       val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number})" }
-                      val notesText = notificationsList.joinToString("\n") { "[${it.type}] ${it.title}: ${it.text}" }
+                      val emailsText = emailsList.joinToString("\n---\n") {
+                          "GÖNDEREN: ${it.sender}\nKONU: ${it.subject}\nEKLER: ${it.attachments.joinToString()}\nİÇERİK: ${it.body}"
+                      }
+
                       val prompt = """
-                          Sen kullanıcının kişisel akıllı asistanısın. Aşağıda kullanıcının telefonundaki güncel veriler var:
+                          Sen kullanıcının kişisel akıllı asistanısın. Aşağıda kullanıcının telefonundaki güncel veriler ve gelen tüm mailler/ekler var:
                           
-                          ALARM: ${alarmState.second}
+                          ALARM DURUMU: ${alarmState.second}
                           CEVAPSIZ ARAMALAR:
                           $callsText
-                          GELEN MAİL VE MESAJLAR:
-                          $notesText
+                          
+                          GELEN E-POSTALAR VE EKLİ DOSYALAR (PDF/EXCEL/SÖZLEŞME):
+                          $emailsText
                           
                           GÖREVİN:
-                          1. Samimi ve profesyonel bir günlük yönetici özeti ver.
-                          2. Hava durumuna uygun genel bir tavsiye ekle (giyim/hava).
-                          3. Acil aranması gerekenler ve cevap bekleyen mailleri maddeler halinde sırala.
-                          4. Varsa takvime kaydedilmesi gereken bir randevu/etkinlik belirt.
+                          1. Kullanıcıya samimi ve profesyonel bir günlük yönetici özeti (Executive Briefing) sun.
+                          2. Maillerdeki ekli dosyaları (teklif, fatura vb.) ve acil cevaplanması gerekenleri özel olarak belirt.
+                          3. Hafta içi alarmı yoksa uyar.
+                          4. Madde madde yapılacaklar listesi sun.
                       """.trimIndent()
 
                       aiSummary = callGemini(prompt)
@@ -643,7 +713,7 @@ jobs:
 
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Text("🧠 AI Yönetici Brifingi", style = MaterialTheme.typography.headlineSmall)
+                      Text("🧠 AI Tam Kapsamlı Yönetici Brifingi", style = MaterialTheme.typography.headlineSmall)
                       Spacer(modifier = Modifier.height(12.dp))
                   }
                   item {
@@ -655,12 +725,12 @@ jobs:
                           if (isLoading) {
                               CircularProgressIndicator(color = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(20.dp))
                               Spacer(modifier = Modifier.width(8.dp))
-                              Text("Analiz Ediliyor...")
+                              Text("Mailler ve Ekler Taranıyor...")
                           } else {
-                              Text("✨ Günlük Durumu Analiz Et")
+                              Text("✨ Mailleri & Durumu Derinlemesine Analiz Et")
                           }
                       }
-                      Spacer(modifier = Modifier.height(12.dp))
+                      Spacer(modifier = Modifier.height(16.dp))
                   }
                   item {
                       Card(
@@ -670,18 +740,16 @@ jobs:
                           Column(modifier = Modifier.padding(16.dp)) {
                               Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                   Text("🤖 Asistan Raporu", style = MaterialTheme.typography.titleMedium)
-                                  Row {
-                                      IconButton(onClick = {
-                                          if (isSpeaking) {
-                                              onStopSpeaking()
-                                              isSpeaking = false
-                                          } else {
-                                              onSpeakText(aiSummary)
-                                              isSpeaking = true
-                                          }
-                                      }) {
-                                          Text(if (isSpeaking) "⏹️" else "🔊")
+                                  IconButton(onClick = {
+                                      if (isSpeaking) {
+                                          onStopSpeaking()
+                                          isSpeaking = false
+                                      } else {
+                                          onSpeakText(aiSummary)
+                                          isSpeaking = true
                                       }
+                                  }) {
+                                      Text(if (isSpeaking) "⏹️" else "🔊")
                                   }
                               }
                               Spacer(modifier = Modifier.height(8.dp))
@@ -700,14 +768,92 @@ jobs:
           }
 
           @Composable
+          fun EmailsScreen(
+              emailsList: List<FullEmailItem>,
+              onFetchEmails: () -> Unit,
+              callGemini: suspend (String) -> String,
+              onCopyToClipboard: (String) -> Unit
+          ) {
+              val scope = rememberCoroutineScope()
+              var replyMap by remember { mutableStateOf<Map<Int, String>>(emptyMap()) }
+              var loadingMap by remember { mutableStateOf<Map<Int, Boolean>>(emptyMap()) }
+
+              LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                  item {
+                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                          Text("📨 Gelen E-Postalar & Ekler", style = MaterialTheme.typography.headlineSmall)
+                          Button(onClick = onFetchEmails) {
+                              Text("🔄 Çek")
+                          }
+                      }
+                      Spacer(modifier = Modifier.height(8.dp))
+                      if (emailsList.isEmpty()) {
+                          Text("Henüz mail çekilmedi veya Ayarlar'da e-posta şifresi girilmedi.")
+                      }
+                  }
+                  items(emailsList.mapIndexed { index, item -> Pair(index, item) }) { (idx, item) ->
+                      Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                          Column(modifier = Modifier.padding(12.dp)) {
+                              Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                                  Text(item.sender, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                  Text(item.date, style = MaterialTheme.typography.labelSmall)
+                              }
+                              Text("Konu: ${item.subject}", style = MaterialTheme.typography.bodyMedium)
+                              if (item.attachments.isNotEmpty()) {
+                                  Spacer(modifier = Modifier.height(4.dp))
+                                  Text("📎 Ekler: ${item.attachments.joinToString()}", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium)
+                              }
+                              Spacer(modifier = Modifier.height(4.dp))
+                              Text(item.body, style = MaterialTheme.typography.bodySmall, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                              Spacer(modifier = Modifier.height(8.dp))
+
+                              Button(
+                                  onClick = {
+                                      scope.launch {
+                                          loadingMap = loadingMap + (idx to true)
+                                          val prompt = "Aşağıdaki maile profesyonel 3 Türkçe yanıt taslağı hazırla:\nKonu: ${item.subject}\nİçerik: ${item.body}"
+                                          val replyDrafts = callGemini(prompt)
+                                          replyMap = replyMap + (idx to replyDrafts)
+                                          loadingMap = loadingMap + (idx to false)
+                                      }
+                                  },
+                                  modifier = Modifier.fillMaxWidth()
+                              ) {
+                                  if (loadingMap[idx] == true) {
+                                      Text("AI Yanıt Taslağı Hazırlıyor...")
+                                  } else {
+                                      Text("⚡ AI Yanıtı Üret")
+                                  }
+                              }
+
+                              replyMap[idx]?.let { drafts ->
+                                  Spacer(modifier = Modifier.height(8.dp))
+                                  Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant), modifier = Modifier.fillMaxWidth()) {
+                                      Column(modifier = Modifier.padding(8.dp)) {
+                                          Text(drafts, style = MaterialTheme.typography.bodySmall)
+                                          Spacer(modifier = Modifier.height(4.dp))
+                                          OutlinedButton(onClick = { onCopyToClipboard(drafts) }, modifier = Modifier.fillMaxWidth()) {
+                                              Text("📋 Yanıtları Kopyala")
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
           fun AiChatScreen(
               alarmState: Pair<Boolean, String>,
               callsList: List<CallInfo>,
+              emailsList: List<FullEmailItem>,
               notificationsList: List<NotificationItem>,
               callGemini: suspend (String) -> String,
               onStartVoiceInput: (((String) -> Unit)) -> Unit
           ) {
-              val messages = remember { mutableStateListOf(ChatMessage("asistan", "Merhaba! Ben kişisel yapay zeka asistanınızım. Bana yazabilir veya mikrofon butonuna basarak sesli konuşabilirsiniz.")) }
+              val messages = remember { mutableStateListOf(ChatMessage("asistan", "Merhaba! Tüm maillerinizi, ekli dosyalarınızı ve cevapsız aramalarınızı biliyorum. İstediğinizi sorabilirsiniz.")) }
               var userInput by remember { mutableStateOf("") }
               var isTyping by remember { mutableStateOf(false) }
               val scope = rememberCoroutineScope()
@@ -720,18 +866,18 @@ jobs:
 
                       scope.launch {
                           val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number})" }
-                          val notesText = notificationsList.joinToString("\n") { "[${it.type}] ${it.title}: ${it.text}" }
+                          val emailsText = emailsList.joinToString("\n") { "Mail: ${it.sender} - ${it.subject} | Ekler: ${it.attachments.joinToString()} | İçerik: ${it.body.take(300)}" }
                           val fullPrompt = """
-                              Sen kullanıcının cep telefonundaki akıllı kişisel asistanısın.
+                              Sen kullanıcının cep telefonundaki akıllı kişisel sekreterisin.
                               Telefon verileri:
                               ALARM: ${alarmState.second}
                               CEVAPSIZ ARAMALAR:
                               $callsText
-                              BİLDİRİM VE MAİLLER:
-                              $notesText
+                              MAİLLER VE EKLERİ:
+                              $emailsText
                               
                               Kullanıcının sorusu: $textToSend
-                              Yanıtını samimi, net ve doğrudan Türkçe ver.
+                              Yanıtını net, kibar ve Türkçe ver.
                           """.trimIndent()
 
                           val reply = callGemini(fullPrompt)
@@ -834,103 +980,69 @@ jobs:
           }
 
           @Composable
-          fun NotificationsScreen(
-              notificationsList: List<NotificationItem>,
-              onOpenNotificationSettings: () -> Unit,
-              callGemini: suspend (String) -> String,
-              onCopyToClipboard: (String) -> Unit
-          ) {
-              val scope = rememberCoroutineScope()
-              var replyMap by remember { mutableStateOf<Map<Int, String>>(emptyMap()) }
-              var loadingMap by remember { mutableStateOf<Map<Int, Boolean>>(emptyMap()) }
-
-              LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                  item {
-                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                          Text("✉️ Mail & Mesajlar", style = MaterialTheme.typography.headlineSmall)
-                          OutlinedButton(onClick = onOpenNotificationSettings) {
-                              Text("İzin Ver")
-                          }
-                      }
-                      Spacer(modifier = Modifier.height(8.dp))
-                  }
-                  items(notificationsList.mapIndexed { index, item -> Pair(index, item) }) { (idx, item) ->
-                      Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                          Column(modifier = Modifier.padding(12.dp)) {
-                              Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                                  Text(item.type, style = MaterialTheme.typography.labelMedium)
-                                  Text(item.time, style = MaterialTheme.typography.labelSmall)
-                              }
-                              Text(item.title, style = MaterialTheme.typography.titleMedium)
-                              Text(item.text, style = MaterialTheme.typography.bodyMedium)
-                              Spacer(modifier = Modifier.height(8.dp))
-
-                              Button(
-                                  onClick = {
-                                      scope.launch {
-                                          loadingMap = loadingMap + (idx to true)
-                                          val prompt = "Aşağıdaki mesaja kibar ve profesyonel 3 farklı Türkçe hızlı yanıt taslağı hazırla (Kabul, Red, Detay):\nMesaj: ${item.text}"
-                                          val replyDrafts = callGemini(prompt)
-                                          replyMap = replyMap + (idx to replyDrafts)
-                                          loadingMap = loadingMap + (idx to false)
-                                      }
-                                  },
-                                  modifier = Modifier.fillMaxWidth()
-                              ) {
-                                  if (loadingMap[idx] == true) {
-                                      Text("AI Cevap Üretiyor...")
-                                  } else {
-                                      Text("⚡ AI Yanıt Taslağı Üret")
-                                  }
-                              }
-
-                              replyMap[idx]?.let { drafts ->
-                                  Spacer(modifier = Modifier.height(8.dp))
-                                  Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant), modifier = Modifier.fillMaxWidth()) {
-                                      Column(modifier = Modifier.padding(8.dp)) {
-                                          Text(drafts, style = MaterialTheme.typography.bodySmall)
-                                          Spacer(modifier = Modifier.height(4.dp))
-                                          OutlinedButton(onClick = { onCopyToClipboard(drafts) }, modifier = Modifier.fillMaxWidth()) {
-                                              Text("📋 Yanıtları Kopyala")
-                                          }
-                                      }
-                                  }
-                              }
-                          }
-                      }
-                  }
-              }
-          }
-
-          @Composable
           fun SettingsScreen(
               getApiKey: () -> String,
               saveApiKey: (String) -> Unit,
+              getEmailConfig: () -> Pair<String, String>,
+              saveEmailConfig: (String, String) -> Unit,
               onClearData: () -> Unit,
               onOpenNotificationSettings: () -> Unit,
               onRequestPermissions: () -> Unit
           ) {
               var keyInput by remember { mutableStateOf(getApiKey()) }
-              var isSaved by remember { mutableStateOf(false) }
+              var isApiKeySaved by remember { mutableStateOf(false) }
+
+              val (savedEmail, savedPass) = getEmailConfig()
+              var emailInput by remember { mutableStateOf(savedEmail) }
+              var passInput by remember { mutableStateOf(savedPass) }
+              var isEmailSaved by remember { mutableStateOf(false) }
 
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Text("⚙️ Ayarlar & Yapay Zeka", style = MaterialTheme.typography.headlineSmall)
+                      Text("⚙️ Ayarlar & E-Posta Entegrasyonu", style = MaterialTheme.typography.headlineSmall)
                       Spacer(modifier = Modifier.height(16.dp))
                   }
                   item {
                       Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
                           Column(modifier = Modifier.padding(16.dp)) {
-                              Text("🔑 Google Gemini API Anahtarı", style = MaterialTheme.typography.titleMedium)
+                              Text("✉️ E-Posta Hesabı (Tam Okuma)", style = MaterialTheme.typography.titleMedium)
                               Spacer(modifier = Modifier.height(4.dp))
-                              Text("Yapay zekanın çalışması için ücretsiz Gemini API anahtarınızı buraya girin.", style = MaterialTheme.typography.bodySmall)
+                              Text("Maillerin tümünü ve PDF/Excel eklerini okumak için posta adresinizi ve Uygulama Şifrenizi girin.", style = MaterialTheme.typography.bodySmall)
+                              Spacer(modifier = Modifier.height(8.dp))
+                              TextField(
+                                  value = emailInput,
+                                  onValueChange = { emailInput = it; isEmailSaved = false },
+                                  placeholder = { Text("ornek@gmail.com") },
+                                  modifier = Modifier.fillMaxWidth()
+                              )
+                              Spacer(modifier = Modifier.height(8.dp))
+                              TextField(
+                                  value = passInput,
+                                  onValueChange = { passInput = it; isEmailSaved = false },
+                                  placeholder = { Text("16 Haneli Uygulama Şifresi") },
+                                  modifier = Modifier.fillMaxWidth()
+                              )
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Button(
+                                  onClick = {
+                                      saveEmailConfig(emailInput, passInput)
+                                      isEmailSaved = true
+                                  },
+                                  modifier = Modifier.fillMaxWidth()
+                              ) {
+                                  Text(if (isEmailSaved) "✅ E-Posta Kaydedildi!" else "E-Posta Bilgilerini Kaydet")
+                              }
+                          }
+                      }
+                  }
+                  item {
+                      Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Text("🔑 Google Gemini API Anahtarı", style = MaterialTheme.typography.titleMedium)
                               Spacer(modifier = Modifier.height(8.dp))
                               TextField(
                                   value = keyInput,
-                                  onValueChange = {
-                                      keyInput = it
-                                      isSaved = false
-                                  },
+                                  onValueChange = { keyInput = it; isApiKeySaved = false },
                                   placeholder = { Text("AIzaSy...") },
                                   modifier = Modifier.fillMaxWidth()
                               )
@@ -938,26 +1050,11 @@ jobs:
                               Button(
                                   onClick = {
                                       saveApiKey(keyInput)
-                                      isSaved = true
+                                      isApiKeySaved = true
                                   },
                                   modifier = Modifier.fillMaxWidth()
                               ) {
-                                  Text(if (isSaved) "✅ Kaydedildi!" else "Anahtarı Kaydet")
-                              }
-                          }
-                      }
-                  }
-                  item {
-                      Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
-                          Column(modifier = Modifier.padding(16.dp)) {
-                              Text("🔐 Sistem İzinleri", style = MaterialTheme.typography.titleMedium)
-                              Spacer(modifier = Modifier.height(8.dp))
-                              Button(onClick = onRequestPermissions, modifier = Modifier.fillMaxWidth()) {
-                                  Text("Tüm İzinleri Yenile (Mikrofon/Arama/Takvim)")
-                              }
-                              Spacer(modifier = Modifier.height(8.dp))
-                              Button(onClick = onOpenNotificationSettings, modifier = Modifier.fillMaxWidth()) {
-                                  Text("Bildirim Dinleme İznini Aç")
+                                  Text(if (isApiKeySaved) "✅ API Kaydedildi!" else "API Anahtarını Kaydet")
                               }
                           }
                       }
@@ -975,7 +1072,7 @@ jobs:
                                   colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                                   modifier = Modifier.fillMaxWidth()
                               ) {
-                                  Text("Tüm Verileri ve Sohbeti Sil")
+                                  Text("Tüm Verileri, Mailleri ve Sohbeti Sil")
                               }
                           }
                       }
