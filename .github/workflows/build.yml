@@ -1,0 +1,364 @@
+name: Asistan APK Uretici
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu Cek
+        uses: actions/checkout@v4
+
+      - name: Java 17 Kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Proje Dosyalarini ve Kodlari Otomatik Olustur
+        run: |
+          mkdir -p app/src/main/java/com/asistan/app
+
+          # settings.gradle.kts
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Asistan"
+          include(":app")
+          EOF
+
+          # build.gradle.kts (Root)
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+
+          # app/build.gradle.kts
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.asistan.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.asistan.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.8"
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+              implementation("androidx.activity:activity-compose:1.8.2")
+              implementation(platform("androidx.compose:compose-bom:2024.02.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+          }
+          EOF
+
+          # app/src/main/AndroidManifest.xml
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_CALL_LOG" />
+              <uses-permission android:name="android.permission.READ_SMS" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_dialog_info"
+                  android:label="Kişisel Asistan"
+                  android:roundIcon="@android:drawable/ic_dialog_info"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AssistantNotificationService"
+                      android:label="Asistan Bildirim Dinleyici"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          # AssistantNotificationService.kt
+          cat << 'EOF' > app/src/main/java/com/asistan/app/AssistantNotificationService.kt
+          package com.asistan.app
+
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+
+          class AssistantNotificationService : NotificationListenerService() {
+              override fun onNotificationPosted(sbn: StatusBarNotification?) {
+                  sbn?.notification?.extras?.let { extras ->
+                      val title = extras.getString("android.title") ?: ""
+                      val text = extras.getCharSequence("android.text")?.toString() ?: ""
+                      val pkg = sbn.packageName ?: ""
+
+                      if (pkg.contains("android.gm") || pkg.contains("outlook") || pkg.contains("whatsapp")) {
+                          val prefs = getSharedPreferences("asistan_veriler", MODE_PRIVATE)
+                          val current = prefs.getString("bildirimler", "") ?: ""
+                          prefs.edit().putString("bildirimler", "$current\n[$title]: $text").apply()
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # MainActivity.kt
+          cat << 'EOF' > app/src/main/java/com/asistan/app/MainActivity.kt
+          package com.asistan.app
+
+          import android.Manifest
+          import android.app.AlarmManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.provider.CallLog
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.ContextCompat
+          import java.util.Calendar
+
+          class MainActivity : ComponentActivity() {
+              private val permissionLauncher = registerForActivityResult(
+                  ActivityResultContracts.RequestMultiplePermissions()
+              ) { _ -> }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  permissionLauncher.launch(
+                      arrayOf(
+                          Manifest.permission.READ_CALL_LOG,
+                          Manifest.permission.READ_SMS,
+                          Manifest.permission.POST_NOTIFICATIONS
+                      )
+                  )
+
+                  setContent {
+                      MaterialTheme {
+                          Surface(modifier = Modifier.fillMaxSize()) {
+                              AssistantScreen(
+                                  onCheckAlarm = { checkAlarmStatus() },
+                                  onCheckCalls = { getUnreturnedCalls() },
+                                  onGetNotifications = { getStoredNotifications() },
+                                  onClearData = { clearAllData() },
+                                  onOpenNotificationSettings = {
+                                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                                  }
+                              )
+                          }
+                      }
+                  }
+              }
+
+              private fun checkAlarmStatus(): String {
+                  val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val nextAlarm = alarmManager.nextAlarmClock
+                  val calendar = Calendar.getInstance()
+                  val dayOfWeek = calendar.get(Calendar.DAY_OF_WEEK)
+                  val isWeekday = dayOfWeek in Calendar.MONDAY..Calendar.FRIDAY
+                  return if (nextAlarm != null) {
+                      "✅ Aktif alarmınız kurulu."
+                  } else if (isWeekday) {
+                      "⚠️ DİKKAT: Hafta içindesiniz fakat yarın için kurulmuş bir alarm bulunamadı!"
+                  } else {
+                      "Hafta sonu, kurulu alarm yok."
+                  }
+              }
+
+              private fun getUnreturnedCalls(): List<String> {
+                  val unreturned = mutableListOf<String>()
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+                      return listOf("Arama günlüğü izni verilmedi.")
+                  }
+                  try {
+                      val cursor = contentResolver.query(
+                          CallLog.Calls.CONTENT_URI,
+                          arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.CACHED_NAME),
+                          null, null, "${CallLog.Calls.DATE} DESC LIMIT 20"
+                      )
+                      cursor?.use {
+                          while (it.moveToNext()) {
+                              val type = it.getInt(it.getColumnIndexOrThrow(CallLog.Calls.TYPE))
+                              val number = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.NUMBER))
+                              val name = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)) ?: number
+
+                              if (type == CallLog.Calls.MISSED_TYPE) {
+                                  unreturned.add("Cevapsız Arama: $name ($number)")
+                              }
+                          }
+                      }
+                  } catch (e: Exception) {
+                      unreturned.add("Aramalar taranırken hata: ${e.message}")
+                  }
+                  return if (unreturned.isEmpty()) listOf("Dönüş yapılmamış cevapsız arama yok.") else unreturned
+              }
+
+              private fun getStoredNotifications(): String {
+                  val prefs = getSharedPreferences("asistan_veriler", MODE_PRIVATE)
+                  return prefs.getString("bildirimler", "Henüz yakalanan mail veya mesaj bildirimi yok.") ?: ""
+              }
+
+              private fun clearAllData() {
+                  val prefs = getSharedPreferences("asistan_veriler", MODE_PRIVATE)
+                  prefs.edit().clear().apply()
+              }
+          }
+
+          @Composable
+          fun AssistantScreen(
+              onCheckAlarm: () -> String,
+              onCheckCalls: () -> List<String>,
+              onGetNotifications: () -> String,
+              onClearData: () -> Unit,
+              onOpenNotificationSettings: () -> Unit
+          ) {
+              var alarmStatus by remember { mutableStateOf("") }
+              var callsList by remember { mutableStateOf<List<String>>(emptyList()) }
+              var notificationsText by remember { mutableStateOf("") }
+
+              LaunchedEffect(Unit) {
+                  alarmStatus = onCheckAlarm()
+                  callsList = onCheckCalls()
+                  notificationsText = onGetNotifications()
+              }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .padding(16.dp)
+                      .verticalScroll(rememberScrollState())
+              ) {
+                  Text("🤖 Kişisel Asistanınız", style = MaterialTheme.typography.headlineMedium)
+                  Spacer(modifier = Modifier.height(16.dp))
+
+                  Card(modifier = Modifier.fillMaxWidth()) {
+                      Column(modifier = Modifier.padding(12.dp)) {
+                          Text("⏰ Alarm Durumu", style = MaterialTheme.typography.titleMedium)
+                          Text(alarmStatus)
+                      }
+                  }
+
+                  Spacer(modifier = Modifier.height(12.dp))
+
+                  Card(modifier = Modifier.fillMaxWidth()) {
+                      Column(modifier = Modifier.padding(12.dp)) {
+                          Text("📞 Cevapsız / Dönüş Bekleyenler", style = MaterialTheme.typography.titleMedium)
+                          callsList.forEach { call ->
+                              Text("• $call", style = MaterialTheme.typography.bodyMedium)
+                          }
+                      }
+                  }
+
+                  Spacer(modifier = Modifier.height(12.dp))
+
+                  Card(modifier = Modifier.fillMaxWidth()) {
+                      Column(modifier = Modifier.padding(12.dp)) {
+                          Text("✉️ Mail & Mesaj Bildirimleri", style = MaterialTheme.typography.titleMedium)
+                          Text(notificationsText, style = MaterialTheme.typography.bodySmall)
+                      }
+                  }
+
+                  Spacer(modifier = Modifier.height(20.dp))
+
+                  Button(
+                      onClick = onOpenNotificationSettings,
+                      modifier = Modifier.fillMaxWidth()
+                  ) {
+                      Text("Mail/Mesaj Dinleme İznini Aç")
+                  }
+
+                  Spacer(modifier = Modifier.height(8.dp))
+
+                  Button(
+                      onClick = {
+                          onClearData()
+                          notificationsText = "Tüm veriler başarıyla silindi."
+                      },
+                      colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                      modifier = Modifier.fillMaxWidth()
+                  ) {
+                      Text("Tüm Verileri Temizle (Sıfırla)")
+                  }
+              }
+          }
+          EOF
+
+      - name: Gradle Kur
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Android SDK ve Lisanslari Onayla
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: APK Derle
+        run: gradle assembleDebug --stacktrace
+
+      - name: APK'yi Indirilebilir Yap
+        uses: actions/upload-artifact@v4
+        with:
+          name: Asistan-APK
+          path: app/build/outputs/apk/debug/*.apk
