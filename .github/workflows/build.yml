@@ -72,8 +72,8 @@ jobs:
                   applicationId = "com.asistan.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0"
+                  versionCode = 3
+                  versionName = "3.0-AI"
               }
 
               compileOptions {
@@ -101,6 +101,7 @@ jobs:
               implementation("androidx.compose.ui:ui-graphics")
               implementation("androidx.compose.ui:ui-tooling-preview")
               implementation("androidx.compose.material3:material3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
           }
           EOF
 
@@ -108,6 +109,8 @@ jobs:
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <!-- İnternet İzni (Yapay Zeka İçin) -->
+              <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.READ_CALL_LOG" />
               <uses-permission android:name="android.permission.READ_SMS" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -115,7 +118,7 @@ jobs:
               <application
                   android:allowBackup="true"
                   android:icon="@android:drawable/ic_dialog_info"
-                  android:label="Kişisel Asistan"
+                  android:label="AI Kişisel Asistan"
                   android:roundIcon="@android:drawable/ic_dialog_info"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.Material.Light.NoActionBar">
@@ -131,7 +134,7 @@ jobs:
 
                   <service
                       android:name=".AssistantNotificationService"
-                      android:label="Asistan Bildirim Dinleyici"
+                      android:label="AI Asistan Bildirim Dinleyici"
                       android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
                       android:exported="true">
                       <intent-filter>
@@ -197,19 +200,31 @@ jobs:
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.unit.dp
           import androidx.core.content.ContextCompat
+          import androidx.lifecycle.lifecycleScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.OutputStreamWriter
+          import java.net.HttpURLConnection
+          import java.net.URL
           import java.util.Calendar
 
           data class CallInfo(val name: String, val number: String, val date: String)
           data class NotificationItem(val time: String, val type: String, val title: String, val text: String)
+          data class ChatMessage(val sender: String, val text: String)
 
           class MainActivity : ComponentActivity() {
 
@@ -236,7 +251,10 @@ jobs:
                                   onOpenNotificationSettings = {
                                       startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                                   },
-                                  onClearData = { clearAllData() }
+                                  onClearData = { clearAllData() },
+                                  getApiKey = { getSavedApiKey() },
+                                  saveApiKey = { key -> saveApiKeyToPrefs(key) },
+                                  callGemini = { prompt -> askGemini(prompt) }
                               )
                           }
                       }
@@ -307,8 +325,69 @@ jobs:
                   }
               }
 
+              private fun saveApiKeyToPrefs(key: String) {
+                  getSharedPreferences("asistan_veriler", MODE_PRIVATE).edit().putString("gemini_key", key.trim()).apply()
+              }
+
+              private fun getSavedApiKey(): String {
+                  return getSharedPreferences("asistan_veriler", MODE_PRIVATE).getString("gemini_key", "") ?: ""
+              }
+
               private fun clearAllData() {
                   getSharedPreferences("asistan_veriler", MODE_PRIVATE).edit().clear().apply()
+              }
+
+              private suspend fun askGemini(prompt: String): String = withContext(Dispatchers.IO) {
+                  val apiKey = getSavedApiKey()
+                  if (apiKey.isBlank()) {
+                      return@withContext "Lütfen önce 'Ayarlar' sekmesinden Gemini API anahtarınızı girin."
+                  }
+                  try {
+                      val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$apiKey")
+                      val conn = url.openConnection() as HttpURLConnection
+                      conn.requestMethod = "POST"
+                      conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                      conn.doOutput = true
+
+                      val jsonBody = JSONObject().apply {
+                          val contents = JSONArray().apply {
+                              val item = JSONObject().apply {
+                                  val parts = JSONArray().apply {
+                                      put(JSONObject().put("text", prompt))
+                                  }
+                                  put("parts", parts)
+                              }
+                              put(item)
+                          }
+                          put("contents", contents)
+                      }
+
+                      OutputStreamWriter(conn.outputStream).use { os ->
+                          os.write(jsonBody.toString())
+                          os.flush()
+                      }
+
+                      val responseCode = conn.responseCode
+                      if (responseCode == 200) {
+                          val responseText = conn.inputStream.bufferedReader().use { it.readText() }
+                          val resJson = JSONObject(responseText)
+                          val candidates = resJson.getJSONArray("candidates")
+                          if (candidates.length() > 0) {
+                              val text = candidates.getJSONObject(0)
+                                  .getJSONObject("content")
+                                  .getJSONArray("parts")
+                                  .getJSONObject(0)
+                                  .getString("text")
+                              return@withContext text
+                          }
+                      } else {
+                          val errorText = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                          return@withContext "API Hatası ($responseCode): $errorText"
+                      }
+                  } catch (e: Exception) {
+                      return@withContext "Bağlantı Hatası: ${e.message}"
+                  }
+                  return@withContext "Bir yanıt alınamadı."
               }
           }
 
@@ -320,10 +399,13 @@ jobs:
               onCallNumber: (String) -> Unit,
               onRequestPermissions: () -> Unit,
               onOpenNotificationSettings: () -> Unit,
-              onClearData: () -> Unit
+              onClearData: () -> Unit,
+              getApiKey: () -> String,
+              saveApiKey: (String) -> Unit,
+              callGemini: suspend (String) -> String
           ) {
               var selectedTab by remember { mutableStateOf(0) }
-              val tabs = listOf("📊 Özet", "📞 Aramalar", "✉️ Mesajlar", "⚙️ Ayarlar")
+              val tabs = listOf("🧠 AI Brifing", "💬 AI Sohbet", "📞 Aramalar", "✉️ Mesajlar", "⚙️ Ayarlar")
 
               var alarmState by remember { mutableStateOf(Pair(true, "Yükleniyor...")) }
               var callsList by remember { mutableStateOf<List<CallInfo>>(emptyList()) }
@@ -346,26 +428,20 @@ jobs:
                               NavigationBarItem(
                                   selected = selectedTab == index,
                                   onClick = { selectedTab = index },
-                                  label = { Text(title) },
+                                  label = { Text(title, style = MaterialTheme.typography.labelSmall) },
                                   icon = { }
                               )
                           }
                       }
-                  },
-                  floatingActionButton = {
-                      ExtendedFloatingActionButton(
-                          onClick = { refreshAll() },
-                          text = { Text("🔄 Yenile") },
-                          icon = { }
-                      )
                   }
               ) { padding ->
                   Box(modifier = Modifier.padding(padding).fillMaxSize()) {
                       when (selectedTab) {
-                          0 -> SummaryScreen(alarmState, callsList, notificationsList, onTabSelect = { selectedTab = it })
-                          1 -> CallsScreen(callsList, onCallNumber, onRequestPermissions)
-                          2 -> NotificationsScreen(notificationsList, onOpenNotificationSettings)
-                          3 -> SettingsScreen(onClearData = {
+                          0 -> AiBriefingScreen(alarmState, callsList, notificationsList, callGemini, onRefresh = { refreshAll() })
+                          1 -> AiChatScreen(alarmState, callsList, notificationsList, callGemini)
+                          2 -> CallsScreen(callsList, onCallNumber, onRequestPermissions)
+                          3 -> NotificationsScreen(notificationsList, onOpenNotificationSettings)
+                          4 -> SettingsScreen(getApiKey, saveApiKey, onClearData = {
                               onClearData()
                               refreshAll()
                           }, onOpenNotificationSettings, onRequestPermissions)
@@ -375,64 +451,172 @@ jobs:
           }
 
           @Composable
-          fun SummaryScreen(
+          fun AiBriefingScreen(
               alarmState: Pair<Boolean, String>,
               callsList: List<CallInfo>,
               notificationsList: List<NotificationItem>,
-              onTabSelect: (Int) -> Unit
+              callGemini: suspend (String) -> String,
+              onRefresh: () -> Unit
           ) {
+              var aiSummary by remember { mutableStateOf("Yapay zekadan günlük yönetici brifingi almak için aşağıdaki butona basın.") }
+              var isLoading by remember { mutableStateOf(false) }
+              val scope = rememberCoroutineScope()
+
+              fun generateBriefing() {
+                  scope.launch {
+                      isLoading = true
+                      onRefresh()
+                      val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number})" }
+                      val notesText = notificationsList.joinToString("\n") { "[${it.type}] ${it.title}: ${it.text}" }
+                      val prompt = """
+                          Sen kullanıcının kişisel asistanısın. Aşağıda kullanıcının telefonundaki güncel veriler var:
+                          
+                          ALARM DURUMU: ${alarmState.second}
+                          CEVAPSIZ ARAMALAR:
+                          $callsText
+                          
+                          GELEN MAİL VE MESAJ BİLDİRİMLERİ:
+                          $notesText
+                          
+                          GÖREVİN:
+                          1. Kullanıcıya kibar ve profesyonel bir yönetici özeti (Executive Briefing) çıkar.
+                          2. Varsa acil cevaplanması gereken mailleri veya geri dönülmesi gereken kişileri vurgula.
+                          3. Hafta içi alarmı yoksa uyar.
+                          4. Madde madde yapılacaklar listesi sun.
+                      """.trimIndent()
+
+                      aiSummary = callGemini(prompt)
+                      isLoading = false
+                  }
+              }
+
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Text("👋 Merhaba, Günlük Durumun", style = MaterialTheme.typography.headlineMedium)
+                      Text("🧠 AI Kişisel Yönetici Brifingi", style = MaterialTheme.typography.headlineSmall)
+                      Spacer(modifier = Modifier.height(12.dp))
+                  }
+                  item {
+                      Button(
+                          onClick = { generateBriefing() },
+                          enabled = !isLoading,
+                          modifier = Modifier.fillMaxWidth()
+                      ) {
+                          if (isLoading) {
+                              CircularProgressIndicator(color = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(20.dp))
+                              Spacer(modifier = Modifier.width(8.dp))
+                              Text("Yapay Zeka Analiz Ediyor...")
+                          } else {
+                              Text("✨ Günlük Durumu Yapay Zekayla Analiz Et")
+                          }
+                      }
                       Spacer(modifier = Modifier.height(16.dp))
                   }
-
                   item {
                       Card(
-                          colors = CardDefaults.cardColors(
-                              containerColor = if (alarmState.first) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer
-                          ),
-                          modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)
+                          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                          modifier = Modifier.fillMaxWidth()
                       ) {
                           Column(modifier = Modifier.padding(16.dp)) {
-                              Text("⏰ Alarm Kontrolü", style = MaterialTheme.typography.titleMedium)
-                              Spacer(modifier = Modifier.height(4.dp))
-                              Text(alarmState.second, style = MaterialTheme.typography.bodyMedium)
+                              Text("🤖 Asistanınızın Değerlendirmesi", style = MaterialTheme.typography.titleMedium)
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Text(aiSummary, style = MaterialTheme.typography.bodyMedium)
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun AiChatScreen(
+              alarmState: Pair<Boolean, String>,
+              callsList: List<CallInfo>,
+              notificationsList: List<NotificationItem>,
+              callGemini: suspend (String) -> String
+          ) {
+              val messages = remember { mutableStateListOf(ChatMessage("asistan", "Merhaba! Ben yapay zeka asistanınızım. Arama, mesaj ve mailleriniz hakkında bana istediğinizi sorabilirsiniz.")) }
+              var userInput by remember { mutableStateOf("") }
+              var isTyping by remember { mutableStateOf(false) }
+              val scope = rememberCoroutineScope()
+
+              Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                  Text("💬 Asistanla Sohbet", style = MaterialTheme.typography.headlineSmall)
+                  Spacer(modifier = Modifier.height(8.dp))
+
+                  LazyColumn(
+                      modifier = Modifier.weight(1f).fillMaxWidth(),
+                      reverseLayout = false
+                  ) {
+                      items(messages) { msg ->
+                          val isUser = msg.sender == "kullanici"
+                          Row(
+                              modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                              horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+                          ) {
+                              Box(
+                                  modifier = Modifier
+                                      .background(
+                                          if (isUser) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                                          shape = RoundedCornerShape(12.dp)
+                                      )
+                                      .padding(12.dp)
+                                      .widthIn(max = 280.dp)
+                              ) {
+                                  Text(
+                                      msg.text,
+                                      color = if (isUser) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+                                  )
+                              }
+                          }
+                      }
+                      if (isTyping) {
+                          item {
+                              Text("🤖 Asistan düşünüyor...", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(8.dp))
                           }
                       }
                   }
 
-                  item {
-                      Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
-                          Column(modifier = Modifier.padding(16.dp)) {
-                              Text("📞 Cevapsız Aramalar (${callsList.size})", style = MaterialTheme.typography.titleMedium)
-                              Spacer(modifier = Modifier.height(4.dp))
-                              if (callsList.isEmpty()) {
-                                  Text("Harika! Dönüş yapılmamış cevapsız arama yok.")
-                              } else {
-                                  Text("İlgilenmen gereken ${callsList.size} cevapsız arama var.")
-                                  Button(onClick = { onTabSelect(1) }, modifier = Modifier.padding(top = 8.dp)) {
-                                      Text("Aramaları Gör")
-                                  }
-                              }
-                          }
-                      }
-                  }
+                  Spacer(modifier = Modifier.height(8.dp))
 
-                  item {
-                      Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
-                          Column(modifier = Modifier.padding(16.dp)) {
-                              Text("✉️ Son Mesaj & Mailler (${notificationsList.size})", style = MaterialTheme.typography.titleMedium)
-                              Spacer(modifier = Modifier.height(4.dp))
-                              if (notificationsList.isEmpty()) {
-                                  Text("Henüz yakalanmış bir bildirim bulunmuyor.")
-                              } else {
-                                  Text("Toplam ${notificationsList.size} adet mail/mesaj kaydedildi.")
-                                  Button(onClick = { onTabSelect(2) }, modifier = Modifier.padding(top = 8.dp)) {
-                                      Text("Mesajları İncele")
+                  Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                      TextField(
+                          value = userInput,
+                          onValueChange = { userInput = it },
+                          placeholder = { Text("Asistana bir soru sorun...") },
+                          modifier = Modifier.weight(1f)
+                      )
+                      Spacer(modifier = Modifier.width(8.dp))
+                      Button(
+                          onClick = {
+                              if (userInput.isNotBlank() && !isTyping) {
+                                  val userText = userInput
+                                  messages.add(ChatMessage("kullanici", userText))
+                                  userInput = ""
+                                  isTyping = true
+
+                                  scope.launch {
+                                      val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number})" }
+                                      val notesText = notificationsList.joinToString("\n") { "[${it.type}] ${it.title}: ${it.text}" }
+                                      val fullPrompt = """
+                                          Sen kullanıcının cep telefonundaki akıllı kişisel asistanısın.
+                                          Telefon verileri:
+                                          ALARM: ${alarmState.second}
+                                          CEVAPSIZ ARAMALAR:
+                                          $callsText
+                                          BİLDİRİM VE MAİLLER:
+                                          $notesText
+                                          
+                                          Kullanıcının sorusu: $userText
+                                          Yanıtını kibar, net ve doğrudan ver.
+                                      """.trimIndent()
+
+                                      val reply = callGemini(fullPrompt)
+                                      messages.add(ChatMessage("asistan", reply))
+                                      isTyping = false
                                   }
                               }
                           }
+                      ) {
+                          Text("Gönder")
                       }
                   }
               }
@@ -442,10 +626,10 @@ jobs:
           fun CallsScreen(callsList: List<CallInfo>, onCallNumber: (String) -> Unit, onRequestPermissions: () -> Unit) {
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Text("📞 Cevapsız & Dönüş Bekleyenler", style = MaterialTheme.typography.headlineSmall)
+                      Text("📞 Cevapsız Aramalar (${callsList.size})", style = MaterialTheme.typography.headlineSmall)
                       Spacer(modifier = Modifier.height(8.dp))
                       if (callsList.isEmpty()) {
-                          Text("Arama kaydı bulunamadı veya izin eksik.")
+                          Text("Cevapsız arama kaydı yok veya arama izni verilmedi.")
                           Button(onClick = onRequestPermissions, modifier = Modifier.padding(top = 8.dp)) {
                               Text("Arama İznini Yenile")
                           }
@@ -464,7 +648,7 @@ jobs:
                                   Text(call.number, style = MaterialTheme.typography.bodySmall)
                               }
                               Button(onClick = { onCallNumber(call.number) }) {
-                                  Text("Geri Ara")
+                                  Text("Ara")
                               }
                           }
                       }
@@ -476,20 +660,13 @@ jobs:
           fun NotificationsScreen(notificationsList: List<NotificationItem>, onOpenNotificationSettings: () -> Unit) {
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Row(
-                          modifier = Modifier.fillMaxWidth(),
-                          horizontalArrangement = Arrangement.SpaceBetween,
-                          verticalAlignment = Alignment.CenterVertically
-                      ) {
-                          Text("✉️ Mail ve Mesajlar", style = MaterialTheme.typography.headlineSmall)
+                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                          Text("✉️ Mail & Mesajlar", style = MaterialTheme.typography.headlineSmall)
                           OutlinedButton(onClick = onOpenNotificationSettings) {
-                              Text("İzin Ayarı")
+                              Text("İzin Ver")
                           }
                       }
                       Spacer(modifier = Modifier.height(8.dp))
-                      if (notificationsList.isEmpty()) {
-                          Text("Henüz yakalanan bildirim yok. Mail veya WhatsApp bildirimi geldiğinde otomatik buraya eklenecektir.")
-                      }
                   }
                   items(notificationsList) { item ->
                       Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
@@ -507,11 +684,49 @@ jobs:
           }
 
           @Composable
-          fun SettingsScreen(onClearData: () -> Unit, onOpenNotificationSettings: () -> Unit, onRequestPermissions: () -> Unit) {
+          fun SettingsScreen(
+              getApiKey: () -> String,
+              saveApiKey: (String) -> Unit,
+              onClearData: () -> Unit,
+              onOpenNotificationSettings: () -> Unit,
+              onRequestPermissions: () -> Unit
+          ) {
+              var keyInput by remember { mutableStateOf(getApiKey()) }
+              var isSaved by remember { mutableStateOf(false) }
+
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Text("⚙️ Ayarlar & İzinler", style = MaterialTheme.typography.headlineSmall)
+                      Text("⚙️ Ayarlar & Yapay Zeka", style = MaterialTheme.typography.headlineSmall)
                       Spacer(modifier = Modifier.height(16.dp))
+                  }
+                  item {
+                      Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Text("🔑 Google Gemini API Anahtarı", style = MaterialTheme.typography.titleMedium)
+                              Spacer(modifier = Modifier.height(4.dp))
+                              Text("Yapay zekanın çalışması için ücretsiz Gemini API anahtarınızı buraya girin.", style = MaterialTheme.typography.bodySmall)
+                              Spacer(modifier = Modifier.height(8.dp))
+                              TextField(
+                                  value = keyInput,
+                                  onValueChange = {
+                                      keyInput = it
+                                      isSaved = false
+                                  },
+                                  placeholder = { Text("AIzaSy...") },
+                                  modifier = Modifier.fillMaxWidth()
+                              )
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Button(
+                                  onClick = {
+                                      saveApiKey(keyInput)
+                                      isSaved = true
+                                  },
+                                  modifier = Modifier.fillMaxWidth()
+                              ) {
+                                  Text(if (isSaved) "✅ Kaydedildi!" else "Anahtarı Kaydet")
+                              }
+                          }
+                      }
                   }
                   item {
                       Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
@@ -519,7 +734,7 @@ jobs:
                               Text("🔐 Sistem İzinleri", style = MaterialTheme.typography.titleMedium)
                               Spacer(modifier = Modifier.height(8.dp))
                               Button(onClick = onRequestPermissions, modifier = Modifier.fillMaxWidth()) {
-                                  Text("Arama ve SMS İzinlerini İste")
+                                  Text("Arama ve SMS İznini Yenile")
                               }
                               Spacer(modifier = Modifier.height(8.dp))
                               Button(onClick = onOpenNotificationSettings, modifier = Modifier.fillMaxWidth()) {
@@ -534,15 +749,14 @@ jobs:
                           modifier = Modifier.fillMaxWidth()
                       ) {
                           Column(modifier = Modifier.padding(16.dp)) {
-                              Text("🗑️ Gizlilik ve Veri Sıfırlama", style = MaterialTheme.typography.titleMedium)
-                              Text("Uygulamanın telefonunuzda sakladığı tüm verileri anında kalıcı olarak siler.", style = MaterialTheme.typography.bodySmall)
-                              Spacer(modifier = Modifier.height(12.dp))
+                              Text("🗑️ Tüm Verileri Sıfırla", style = MaterialTheme.typography.titleMedium)
+                              Spacer(modifier = Modifier.height(8.dp))
                               Button(
                                   onClick = onClearData,
                                   colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                                   modifier = Modifier.fillMaxWidth()
                               ) {
-                                  Text("Tüm Verileri Şimdi Sıfırla")
+                                  Text("Tüm Verileri ve Sohbeti Sil")
                               }
                           }
                       }
