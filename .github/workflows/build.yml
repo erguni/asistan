@@ -72,8 +72,8 @@ jobs:
                   applicationId = "com.asistan.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 4
-                  versionName = "4.0-AI"
+                  versionCode = 5
+                  versionName = "5.0-Ultimate-AI"
               }
 
               compileOptions {
@@ -102,6 +102,7 @@ jobs:
               implementation("androidx.compose.ui:ui-tooling-preview")
               implementation("androidx.compose.material3:material3")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+              implementation("androidx.work:work-runtime-ktx:2.9.0")
           }
           EOF
 
@@ -109,15 +110,19 @@ jobs:
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <!-- Gerekli Tüm Sistem ve Donanım İzinleri -->
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.READ_CALL_LOG" />
               <uses-permission android:name="android.permission.READ_SMS" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.READ_CALENDAR" />
+              <uses-permission android:name="android.permission.WRITE_CALENDAR" />
 
               <application
                   android:allowBackup="true"
                   android:icon="@android:drawable/ic_dialog_info"
-                  android:label="AI Kişisel Asistan"
+                  android:label="Ultimate AI Asistan"
                   android:roundIcon="@android:drawable/ic_dialog_info"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.Material.Light.NoActionBar">
@@ -183,19 +188,66 @@ jobs:
           }
           EOF
 
+          # AssistantWorker.kt (Arka Plan Kontrolcüsü)
+          cat << 'EOF' > app/src/main/java/com/asistan/app/AssistantWorker.kt
+          package com.asistan.app
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.Context
+          import android.os.Build
+          import androidx.core.app.NotificationCompat
+          import androidx.work.CoroutineWorker
+          import androidx.work.WorkerParameters
+
+          class AssistantWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+              override suspend fun doWork(): Result {
+                  val prefs = applicationContext.getSharedPreferences("asistan_veriler", Context.MODE_PRIVATE)
+                  val notifCount = prefs.getString("bildirimler_listesi", "")?.split("|||")?.filter { it.isNotBlank() }?.size ?: 0
+                  
+                  if (notifCount > 0) {
+                      showNotification("🤖 Asistan Hatırlatması", "İncelemeniz gereken yeni mail veya mesaj bildirimleri var.")
+                  }
+                  return Result.success()
+              }
+
+              private fun showNotification(title: String, message: String) {
+                  val manager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  val channelId = "asistan_alerts"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(channelId, "Asistan Bildirimleri", NotificationManager.IMPORTANCE_DEFAULT)
+                      manager.createNotificationChannel(channel)
+                  }
+                  val notification = NotificationCompat.Builder(applicationContext, channelId)
+                      .setContentTitle(title)
+                      .setContentText(message)
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .setAutoCancel(true)
+                      .build()
+                  manager.notify(1001, notification)
+              }
+          }
+          EOF
+
           # MainActivity.kt
           cat << 'EOF' > app/src/main/java/com/asistan/app/MainActivity.kt
           package com.asistan.app
 
           import android.Manifest
           import android.app.AlarmManager
+          import android.content.ClipData
+          import android.content.ClipboardManager
           import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.net.Uri
           import android.os.Bundle
+          import android.provider.CalendarContract
           import android.provider.CallLog
           import android.provider.Settings
+          import android.speech.RecognizerIntent
+          import android.speech.tts.TextToSpeech
+          import android.widget.Toast
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
@@ -211,6 +263,8 @@ jobs:
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.core.content.ContextCompat
+          import androidx.work.PeriodicWorkRequestBuilder
+          import androidx.work.WorkManager
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
@@ -220,20 +274,36 @@ jobs:
           import java.net.HttpURLConnection
           import java.net.URL
           import java.util.Calendar
+          import java.util.Locale
+          import java.util.concurrent.TimeUnit
 
           data class CallInfo(val name: String, val number: String, val date: String)
           data class NotificationItem(val time: String, val type: String, val title: String, val text: String)
           data class ChatMessage(val sender: String, val text: String)
 
-          class MainActivity : ComponentActivity() {
+          class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
+
+              private var tts: TextToSpeech? = null
+              private var voiceInputCallback: ((String) -> Unit)? = null
 
               private val permissionLauncher = registerForActivityResult(
                   ActivityResultContracts.RequestMultiplePermissions()
               ) { _ -> }
 
+              private val speechLauncher = registerForActivityResult(
+                  ActivityResultContracts.StartActivityForResult()
+              ) { result ->
+                  if (result.resultCode == RESULT_OK && result.data != null) {
+                      val spokenText = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.get(0) ?: ""
+                      voiceInputCallback?.invoke(spokenText)
+                  }
+              }
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  tts = TextToSpeech(this, this)
                   requestAppPermissions()
+                  setupBackgroundWorker()
 
                   setContent {
                       MaterialTheme {
@@ -243,8 +313,7 @@ jobs:
                                   onRefreshCalls = { getUnreturnedCalls() },
                                   onRefreshNotifications = { getStoredNotifications() },
                                   onCallNumber = { num ->
-                                      val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num"))
-                                      startActivity(intent)
+                                      startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num")))
                                   },
                                   onRequestPermissions = { requestAppPermissions() },
                                   onOpenNotificationSettings = {
@@ -253,11 +322,63 @@ jobs:
                                   onClearData = { clearAllData() },
                                   getApiKey = { getSavedApiKey() },
                                   saveApiKey = { key -> saveApiKeyToPrefs(key) },
-                                  callGemini = { prompt -> askGemini(prompt) }
+                                  callGemini = { prompt -> askGemini(prompt) },
+                                  onSpeakText = { text -> speakOut(text) },
+                                  onStopSpeaking = { stopSpeaking() },
+                                  onStartVoiceInput = { callback ->
+                                      voiceInputCallback = callback
+                                      startVoiceRecognition()
+                                  },
+                                  onCopyToClipboard = { text -> copyToClipboard(text) },
+                                  onAddToCalendar = { title, desc -> openCalendarInsert(title, desc) }
                               )
                           }
                       }
                   }
+              }
+
+              override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) {
+                      tts?.language = Locale("tr", "TR")
+                  }
+              }
+
+              private fun speakOut(text: String) {
+                  tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "AsistanTTS")
+              }
+
+              private fun stopSpeaking() {
+                  tts?.stop()
+              }
+
+              private fun startVoiceRecognition() {
+                  val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, "tr-TR")
+                      putExtra(RecognizerIntent.EXTRA_PROMPT, "Asistan dinliyor...")
+                  }
+                  speechLauncher.launch(intent)
+              }
+
+              private fun copyToClipboard(text: String) {
+                  val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  val clip = ClipData.newPlainText("AI Yanıtı", text)
+                  clipboard.setPrimaryClip(clip)
+                  Toast.makeText(this, "Panoya kopyalandı!", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun openCalendarInsert(title: String, description: String) {
+                  val intent = Intent(Intent.ACTION_INSERT).apply {
+                      data = CalendarContract.Events.CONTENT_URI
+                      putExtra(CalendarContract.Events.TITLE, title)
+                      putExtra(CalendarContract.Events.DESCRIPTION, description)
+                  }
+                  startActivity(intent)
+              }
+
+              private fun setupBackgroundWorker() {
+                  val workRequest = PeriodicWorkRequestBuilder<AssistantWorker>(3, TimeUnit.HOURS).build()
+                  WorkManager.getInstance(this).enqueue(workRequest)
               }
 
               private fun requestAppPermissions() {
@@ -265,7 +386,10 @@ jobs:
                       arrayOf(
                           Manifest.permission.READ_CALL_LOG,
                           Manifest.permission.READ_SMS,
-                          Manifest.permission.POST_NOTIFICATIONS
+                          Manifest.permission.RECORD_AUDIO,
+                          Manifest.permission.POST_NOTIFICATIONS,
+                          Manifest.permission.READ_CALENDAR,
+                          Manifest.permission.WRITE_CALENDAR
                       )
                   )
               }
@@ -278,11 +402,11 @@ jobs:
                   val isWeekday = dayOfWeek in Calendar.MONDAY..Calendar.FRIDAY
 
                   return if (nextAlarm != null) {
-                      Pair(true, "Aktif bir alarmınız kurulu.")
+                      Pair(true, "Aktif alarmınız kurulu.")
                   } else if (isWeekday) {
-                      Pair(false, "Yarın hafta içi fakat henüz kurulmuş bir alarm bulunamadı!")
+                      Pair(false, "Yarın hafta içi fakat alarm bulunamadı!")
                   } else {
-                      Pair(true, "Hafta sonundasınız, aktif alarm yok.")
+                      Pair(true, "Hafta sonu, alarm yok.")
                   }
               }
 
@@ -339,7 +463,7 @@ jobs:
               private suspend fun askGemini(prompt: String): String = withContext(Dispatchers.IO) {
                   val apiKey = getSavedApiKey()
                   if (apiKey.isBlank()) {
-                      return@withContext "Lütfen önce 'Ayarlar' sekmesinden Gemini API anahtarınızı girin."
+                      return@withContext "Lütfen 'Ayarlar' sekmesinden Gemini API anahtarınızı girin."
                   }
 
                   val modelsToTry = listOf("gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-2.5-flash", "gemini-pro")
@@ -395,6 +519,12 @@ jobs:
                   }
                   return@withContext "Yapay zeka modellerine ulaşılamadı. Son hata: $lastError"
               }
+
+              override fun onDestroy() {
+                  tts?.stop()
+                  tts?.shutdown()
+                  super.onDestroy()
+              }
           }
 
           @Composable
@@ -408,7 +538,12 @@ jobs:
               onClearData: () -> Unit,
               getApiKey: () -> String,
               saveApiKey: (String) -> Unit,
-              callGemini: suspend (String) -> String
+              callGemini: suspend (String) -> String,
+              onSpeakText: (String) -> Unit,
+              onStopSpeaking: () -> Unit,
+              onStartVoiceInput: (((String) -> Unit)) -> Unit,
+              onCopyToClipboard: (String) -> Unit,
+              onAddToCalendar: (String, String) -> Unit
           ) {
               var selectedTab by remember { mutableStateOf(0) }
               val tabs = listOf("Brifing", "Sohbet", "Arama", "Mesaj", "Ayarlar")
@@ -450,10 +585,10 @@ jobs:
               ) { padding ->
                   Box(modifier = Modifier.padding(padding).fillMaxSize()) {
                       when (selectedTab) {
-                          0 -> AiBriefingScreen(alarmState, callsList, notificationsList, callGemini, onRefresh = { refreshAll() })
-                          1 -> AiChatScreen(alarmState, callsList, notificationsList, callGemini)
+                          0 -> AiBriefingScreen(alarmState, callsList, notificationsList, callGemini, onRefresh = { refreshAll() }, onSpeakText, onStopSpeaking, onAddToCalendar)
+                          1 -> AiChatScreen(alarmState, callsList, notificationsList, callGemini, onStartVoiceInput)
                           2 -> CallsScreen(callsList, onCallNumber, onRequestPermissions)
-                          3 -> NotificationsScreen(notificationsList, onOpenNotificationSettings)
+                          3 -> NotificationsScreen(notificationsList, onOpenNotificationSettings, callGemini, onCopyToClipboard)
                           4 -> SettingsScreen(getApiKey, saveApiKey, onClearData = {
                               onClearData()
                               refreshAll()
@@ -469,10 +604,14 @@ jobs:
               callsList: List<CallInfo>,
               notificationsList: List<NotificationItem>,
               callGemini: suspend (String) -> String,
-              onRefresh: () -> Unit
+              onRefresh: () -> Unit,
+              onSpeakText: (String) -> Unit,
+              onStopSpeaking: () -> Unit,
+              onAddToCalendar: (String, String) -> Unit
           ) {
               var aiSummary by remember { mutableStateOf("Yapay zekadan günlük yönetici brifingi almak için aşağıdaki butona basın.") }
               var isLoading by remember { mutableStateOf(false) }
+              var isSpeaking by remember { mutableStateOf(false) }
               val scope = rememberCoroutineScope()
 
               fun generateBriefing() {
@@ -484,18 +623,17 @@ jobs:
                       val prompt = """
                           Sen kullanıcının kişisel akıllı asistanısın. Aşağıda kullanıcının telefonundaki güncel veriler var:
                           
-                          ALARM DURUMU: ${alarmState.second}
+                          ALARM: ${alarmState.second}
                           CEVAPSIZ ARAMALAR:
                           $callsText
-                          
-                          GELEN MAİL VE MESAJ BİLDİRİMLERİ:
+                          GELEN MAİL VE MESAJLAR:
                           $notesText
                           
                           GÖREVİN:
-                          1. Kullanıcıya samimi, kibar ve profesyonel bir günlük özet çıkar.
-                          2. Varsa acil cevaplanması gereken mailleri veya aranması gereken kişileri vurgula.
-                          3. Hafta içi alarmı yoksa uyar.
-                          4. Madde madde yapılacaklar listesi sun.
+                          1. Samimi ve profesyonel bir günlük yönetici özeti ver.
+                          2. Hava durumuna uygun genel bir tavsiye ekle (giyim/hava).
+                          3. Acil aranması gerekenler ve cevap bekleyen mailleri maddeler halinde sırala.
+                          4. Varsa takvime kaydedilmesi gereken bir randevu/etkinlik belirt.
                       """.trimIndent()
 
                       aiSummary = callGemini(prompt)
@@ -505,7 +643,7 @@ jobs:
 
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Text("🧠 AI Günlük Yönetici Brifingi", style = MaterialTheme.typography.headlineSmall)
+                      Text("🧠 AI Yönetici Brifingi", style = MaterialTheme.typography.headlineSmall)
                       Spacer(modifier = Modifier.height(12.dp))
                   }
                   item {
@@ -517,12 +655,12 @@ jobs:
                           if (isLoading) {
                               CircularProgressIndicator(color = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(20.dp))
                               Spacer(modifier = Modifier.width(8.dp))
-                              Text("Yapay Zeka Analiz Ediyor...")
+                              Text("Analiz Ediliyor...")
                           } else {
-                              Text("✨ Günlük Durumu Yapay Zekayla Analiz Et")
+                              Text("✨ Günlük Durumu Analiz Et")
                           }
                       }
-                      Spacer(modifier = Modifier.height(16.dp))
+                      Spacer(modifier = Modifier.height(12.dp))
                   }
                   item {
                       Card(
@@ -530,9 +668,31 @@ jobs:
                           modifier = Modifier.fillMaxWidth()
                       ) {
                           Column(modifier = Modifier.padding(16.dp)) {
-                              Text("🤖 Asistanınızın Değerlendirmesi", style = MaterialTheme.typography.titleMedium)
+                              Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                  Text("🤖 Asistan Raporu", style = MaterialTheme.typography.titleMedium)
+                                  Row {
+                                      IconButton(onClick = {
+                                          if (isSpeaking) {
+                                              onStopSpeaking()
+                                              isSpeaking = false
+                                          } else {
+                                              onSpeakText(aiSummary)
+                                              isSpeaking = true
+                                          }
+                                      }) {
+                                          Text(if (isSpeaking) "⏹️" else "🔊")
+                                      }
+                                  }
+                              }
                               Spacer(modifier = Modifier.height(8.dp))
                               Text(aiSummary, style = MaterialTheme.typography.bodyMedium)
+                              Spacer(modifier = Modifier.height(12.dp))
+                              OutlinedButton(
+                                  onClick = { onAddToCalendar("Asistan Görevi", aiSummary) },
+                                  modifier = Modifier.fillMaxWidth()
+                              ) {
+                                  Text("📅 Takvime Hatırlatıcı Ekle")
+                              }
                           }
                       }
                   }
@@ -544,21 +704,48 @@ jobs:
               alarmState: Pair<Boolean, String>,
               callsList: List<CallInfo>,
               notificationsList: List<NotificationItem>,
-              callGemini: suspend (String) -> String
+              callGemini: suspend (String) -> String,
+              onStartVoiceInput: (((String) -> Unit)) -> Unit
           ) {
-              val messages = remember { mutableStateListOf(ChatMessage("asistan", "Merhaba! Ben yapay zeka asistanınızım. Arama, mesaj ve mailleriniz hakkında bana istediğinizi sorabilirsiniz.")) }
+              val messages = remember { mutableStateListOf(ChatMessage("asistan", "Merhaba! Ben kişisel yapay zeka asistanınızım. Bana yazabilir veya mikrofon butonuna basarak sesli konuşabilirsiniz.")) }
               var userInput by remember { mutableStateOf("") }
               var isTyping by remember { mutableStateOf(false) }
               val scope = rememberCoroutineScope()
+
+              fun sendMessage(textToSend: String) {
+                  if (textToSend.isNotBlank() && !isTyping) {
+                      messages.add(ChatMessage("kullanici", textToSend))
+                      userInput = ""
+                      isTyping = true
+
+                      scope.launch {
+                          val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number})" }
+                          val notesText = notificationsList.joinToString("\n") { "[${it.type}] ${it.title}: ${it.text}" }
+                          val fullPrompt = """
+                              Sen kullanıcının cep telefonundaki akıllı kişisel asistanısın.
+                              Telefon verileri:
+                              ALARM: ${alarmState.second}
+                              CEVAPSIZ ARAMALAR:
+                              $callsText
+                              BİLDİRİM VE MAİLLER:
+                              $notesText
+                              
+                              Kullanıcının sorusu: $textToSend
+                              Yanıtını samimi, net ve doğrudan Türkçe ver.
+                          """.trimIndent()
+
+                          val reply = callGemini(fullPrompt)
+                          messages.add(ChatMessage("asistan", reply))
+                          isTyping = false
+                      }
+                  }
+              }
 
               Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   Text("💬 Asistanla Sohbet", style = MaterialTheme.typography.headlineSmall)
                   Spacer(modifier = Modifier.height(8.dp))
 
-                  LazyColumn(
-                      modifier = Modifier.weight(1f).fillMaxWidth(),
-                      reverseLayout = false
-                  ) {
+                  LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
                       items(messages) { msg ->
                           val isUser = msg.sender == "kullanici"
                           Row(
@@ -591,44 +778,21 @@ jobs:
                   Spacer(modifier = Modifier.height(8.dp))
 
                   Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                      IconButton(onClick = {
+                          onStartVoiceInput { spokenText ->
+                              sendMessage(spokenText)
+                          }
+                      }) {
+                          Text("🎙️")
+                      }
                       TextField(
                           value = userInput,
                           onValueChange = { userInput = it },
-                          placeholder = { Text("Bir şey sorun...") },
+                          placeholder = { Text("Sorun veya sesle konuşun...") },
                           modifier = Modifier.weight(1f)
                       )
-                      Spacer(modifier = Modifier.width(8.dp))
-                      Button(
-                          onClick = {
-                              if (userInput.isNotBlank() && !isTyping) {
-                                  val userText = userInput
-                                  messages.add(ChatMessage("kullanici", userText))
-                                  userInput = ""
-                                  isTyping = true
-
-                                  scope.launch {
-                                      val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number})" }
-                                      val notesText = notificationsList.joinToString("\n") { "[${it.type}] ${it.title}: ${it.text}" }
-                                      val fullPrompt = """
-                                          Sen kullanıcının cep telefonundaki akıllı kişisel asistanısın.
-                                          Telefon verileri:
-                                          ALARM: ${alarmState.second}
-                                          CEVAPSIZ ARAMALAR:
-                                          $callsText
-                                          BİLDİRİM VE MAİLLER:
-                                          $notesText
-                                          
-                                          Kullanıcının sorusu: $userText
-                                          Yanıtını samimi, net ve doğrudan Türkçe ver.
-                                      """.trimIndent()
-
-                                      val reply = callGemini(fullPrompt)
-                                      messages.add(ChatMessage("asistan", reply))
-                                      isTyping = false
-                                  }
-                              }
-                          }
-                      ) {
+                      Spacer(modifier = Modifier.width(4.dp))
+                      Button(onClick = { sendMessage(userInput) }) {
                           Text("Gönder")
                       }
                   }
@@ -670,7 +834,16 @@ jobs:
           }
 
           @Composable
-          fun NotificationsScreen(notificationsList: List<NotificationItem>, onOpenNotificationSettings: () -> Unit) {
+          fun NotificationsScreen(
+              notificationsList: List<NotificationItem>,
+              onOpenNotificationSettings: () -> Unit,
+              callGemini: suspend (String) -> String,
+              onCopyToClipboard: (String) -> Unit
+          ) {
+              val scope = rememberCoroutineScope()
+              var replyMap by remember { mutableStateOf<Map<Int, String>>(emptyMap()) }
+              var loadingMap by remember { mutableStateOf<Map<Int, Boolean>>(emptyMap()) }
+
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
                       Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -681,7 +854,7 @@ jobs:
                       }
                       Spacer(modifier = Modifier.height(8.dp))
                   }
-                  items(notificationsList) { item ->
+                  items(notificationsList.mapIndexed { index, item -> Pair(index, item) }) { (idx, item) ->
                       Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                           Column(modifier = Modifier.padding(12.dp)) {
                               Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
@@ -690,6 +863,39 @@ jobs:
                               }
                               Text(item.title, style = MaterialTheme.typography.titleMedium)
                               Text(item.text, style = MaterialTheme.typography.bodyMedium)
+                              Spacer(modifier = Modifier.height(8.dp))
+
+                              Button(
+                                  onClick = {
+                                      scope.launch {
+                                          loadingMap = loadingMap + (idx to true)
+                                          val prompt = "Aşağıdaki mesaja kibar ve profesyonel 3 farklı Türkçe hızlı yanıt taslağı hazırla (Kabul, Red, Detay):\nMesaj: ${item.text}"
+                                          val replyDrafts = callGemini(prompt)
+                                          replyMap = replyMap + (idx to replyDrafts)
+                                          loadingMap = loadingMap + (idx to false)
+                                      }
+                                  },
+                                  modifier = Modifier.fillMaxWidth()
+                              ) {
+                                  if (loadingMap[idx] == true) {
+                                      Text("AI Cevap Üretiyor...")
+                                  } else {
+                                      Text("⚡ AI Yanıt Taslağı Üret")
+                                  }
+                              }
+
+                              replyMap[idx]?.let { drafts ->
+                                  Spacer(modifier = Modifier.height(8.dp))
+                                  Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant), modifier = Modifier.fillMaxWidth()) {
+                                      Column(modifier = Modifier.padding(8.dp)) {
+                                          Text(drafts, style = MaterialTheme.typography.bodySmall)
+                                          Spacer(modifier = Modifier.height(4.dp))
+                                          OutlinedButton(onClick = { onCopyToClipboard(drafts) }, modifier = Modifier.fillMaxWidth()) {
+                                              Text("📋 Yanıtları Kopyala")
+                                          }
+                                      }
+                                  }
+                              }
                           }
                       }
                   }
@@ -747,7 +953,7 @@ jobs:
                               Text("🔐 Sistem İzinleri", style = MaterialTheme.typography.titleMedium)
                               Spacer(modifier = Modifier.height(8.dp))
                               Button(onClick = onRequestPermissions, modifier = Modifier.fillMaxWidth()) {
-                                  Text("Arama ve SMS İznini Yenile")
+                                  Text("Tüm İzinleri Yenile (Mikrofon/Arama/Takvim)")
                               }
                               Spacer(modifier = Modifier.height(8.dp))
                               Button(onClick = onOpenNotificationSettings, modifier = Modifier.fillMaxWidth()) {
