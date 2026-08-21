@@ -72,8 +72,8 @@ jobs:
                   applicationId = "com.asistan.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "2.0"
               }
 
               compileOptions {
@@ -148,6 +148,9 @@ jobs:
 
           import android.service.notification.NotificationListenerService
           import android.service.notification.StatusBarNotification
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
 
           class AssistantNotificationService : NotificationListenerService() {
               override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -156,10 +159,22 @@ jobs:
                       val text = extras.getCharSequence("android.text")?.toString() ?: ""
                       val pkg = sbn.packageName ?: ""
 
-                      if (pkg.contains("android.gm") || pkg.contains("outlook") || pkg.contains("whatsapp")) {
+                      if (title.isBlank() && text.isBlank()) return
+
+                      val appType = when {
+                          pkg.contains("gm") || pkg.contains("email") -> "✉️ Mail"
+                          pkg.contains("outlook") -> "💼 Outlook"
+                          pkg.contains("whatsapp") -> "💬 WhatsApp"
+                          pkg.contains("mms") || pkg.contains("sms") -> "📱 SMS"
+                          else -> null
+                      }
+
+                      if (appType != null) {
+                          val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
                           val prefs = getSharedPreferences("asistan_veriler", MODE_PRIVATE)
-                          val current = prefs.getString("bildirimler", "") ?: ""
-                          prefs.edit().putString("bildirimler", "$current\n[$title]: $text").apply()
+                          val current = prefs.getString("bildirimler_listesi", "") ?: ""
+                          val entry = "$time###$appType###$title###$text"
+                          prefs.edit().putString("bildirimler_listesi", "$entry|||$current").apply()
                       }
                   }
               }
@@ -175,6 +190,7 @@ jobs:
           import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
+          import android.net.Uri
           import android.os.Bundle
           import android.provider.CallLog
           import android.provider.Settings
@@ -182,22 +198,52 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.rememberScrollState
-          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.unit.dp
           import androidx.core.content.ContextCompat
           import java.util.Calendar
 
+          data class CallInfo(val name: String, val number: String, val date: String)
+          data class NotificationItem(val time: String, val type: String, val title: String, val text: String)
+
           class MainActivity : ComponentActivity() {
+
               private val permissionLauncher = registerForActivityResult(
                   ActivityResultContracts.RequestMultiplePermissions()
               ) { _ -> }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  requestAppPermissions()
+
+                  setContent {
+                      MaterialTheme {
+                          Surface(modifier = Modifier.fillMaxSize()) {
+                              MainAssistantApp(
+                                  onRefreshAlarms = { checkAlarmStatus() },
+                                  onRefreshCalls = { getUnreturnedCalls() },
+                                  onRefreshNotifications = { getStoredNotifications() },
+                                  onCallNumber = { num ->
+                                      val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num"))
+                                      startActivity(intent)
+                                  },
+                                  onRequestPermissions = { requestAppPermissions() },
+                                  onOpenNotificationSettings = {
+                                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                                  },
+                                  onClearData = { clearAllData() }
+                              )
+                          }
+                      }
+                  }
+              }
+
+              private fun requestAppPermissions() {
                   permissionLauncher.launch(
                       arrayOf(
                           Manifest.permission.READ_CALL_LOG,
@@ -205,152 +251,301 @@ jobs:
                           Manifest.permission.POST_NOTIFICATIONS
                       )
                   )
-
-                  setContent {
-                      MaterialTheme {
-                          Surface(modifier = Modifier.fillMaxSize()) {
-                              AssistantScreen(
-                                  onCheckAlarm = { checkAlarmStatus() },
-                                  onCheckCalls = { getUnreturnedCalls() },
-                                  onGetNotifications = { getStoredNotifications() },
-                                  onClearData = { clearAllData() },
-                                  onOpenNotificationSettings = {
-                                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                                  }
-                              )
-                          }
-                      }
-                  }
               }
 
-              private fun checkAlarmStatus(): String {
+              private fun checkAlarmStatus(): Pair<Boolean, String> {
                   val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
                   val nextAlarm = alarmManager.nextAlarmClock
                   val calendar = Calendar.getInstance()
                   val dayOfWeek = calendar.get(Calendar.DAY_OF_WEEK)
                   val isWeekday = dayOfWeek in Calendar.MONDAY..Calendar.FRIDAY
+
                   return if (nextAlarm != null) {
-                      "✅ Aktif alarmınız kurulu."
+                      Pair(true, "Aktif bir alarmınız kurulu.")
                   } else if (isWeekday) {
-                      "⚠️ DİKKAT: Hafta içindesiniz fakat yarın için kurulmuş bir alarm bulunamadı!"
+                      Pair(false, "Yarın hafta içi fakat henüz kurulmuş bir alarm bulunamadı!")
                   } else {
-                      "Hafta sonu, kurulu alarm yok."
+                      Pair(true, "Hafta sonundasınız, aktif alarm yok.")
                   }
               }
 
-              private fun getUnreturnedCalls(): List<String> {
-                  val unreturned = mutableListOf<String>()
+              private fun getUnreturnedCalls(): List<CallInfo> {
+                  val list = mutableListOf<CallInfo>()
                   if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
-                      return listOf("Arama günlüğü izni verilmedi.")
+                      return emptyList()
                   }
                   try {
                       val cursor = contentResolver.query(
                           CallLog.Calls.CONTENT_URI,
-                          arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.CACHED_NAME),
-                          null, null, "${CallLog.Calls.DATE} DESC LIMIT 20"
+                          arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.CACHED_NAME, CallLog.Calls.DATE),
+                          null, null, "${CallLog.Calls.DATE} DESC LIMIT 30"
                       )
                       cursor?.use {
                           while (it.moveToNext()) {
                               val type = it.getInt(it.getColumnIndexOrThrow(CallLog.Calls.TYPE))
-                              val number = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.NUMBER))
+                              val number = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.NUMBER)) ?: "Bilinmeyen"
                               val name = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)) ?: number
-
                               if (type == CallLog.Calls.MISSED_TYPE) {
-                                  unreturned.add("Cevapsız Arama: $name ($number)")
+                                  list.add(CallInfo(name, number, "Cevapsız"))
                               }
                           }
                       }
-                  } catch (e: Exception) {
-                      unreturned.add("Aramalar taranırken hata: ${e.message}")
-                  }
-                  return if (unreturned.isEmpty()) listOf("Dönüş yapılmamış cevapsız arama yok.") else unreturned
+                  } catch (_: Exception) {}
+                  return list
               }
 
-              private fun getStoredNotifications(): String {
+              private fun getStoredNotifications(): List<NotificationItem> {
                   val prefs = getSharedPreferences("asistan_veriler", MODE_PRIVATE)
-                  return prefs.getString("bildirimler", "Henüz yakalanan mail veya mesaj bildirimi yok.") ?: ""
+                  val raw = prefs.getString("bildirimler_listesi", "") ?: ""
+                  if (raw.isBlank()) return emptyList()
+
+                  return raw.split("|||").filter { it.isNotBlank() }.mapNotNull { item ->
+                      val parts = item.split("###")
+                      if (parts.size >= 4) {
+                          NotificationItem(parts[0], parts[1], parts[2], parts[3])
+                      } else null
+                  }
               }
 
               private fun clearAllData() {
-                  val prefs = getSharedPreferences("asistan_veriler", MODE_PRIVATE)
-                  prefs.edit().clear().apply()
+                  getSharedPreferences("asistan_veriler", MODE_PRIVATE).edit().clear().apply()
               }
           }
 
           @Composable
-          fun AssistantScreen(
-              onCheckAlarm: () -> String,
-              onCheckCalls: () -> List<String>,
-              onGetNotifications: () -> String,
-              onClearData: () -> Unit,
-              onOpenNotificationSettings: () -> Unit
+          fun MainAssistantApp(
+              onRefreshAlarms: () -> Pair<Boolean, String>,
+              onRefreshCalls: () -> List<CallInfo>,
+              onRefreshNotifications: () -> List<NotificationItem>,
+              onCallNumber: (String) -> Unit,
+              onRequestPermissions: () -> Unit,
+              onOpenNotificationSettings: () -> Unit,
+              onClearData: () -> Unit
           ) {
-              var alarmStatus by remember { mutableStateOf("") }
-              var callsList by remember { mutableStateOf<List<String>>(emptyList()) }
-              var notificationsText by remember { mutableStateOf("") }
+              var selectedTab by remember { mutableStateOf(0) }
+              val tabs = listOf("📊 Özet", "📞 Aramalar", "✉️ Mesajlar", "⚙️ Ayarlar")
 
-              LaunchedEffect(Unit) {
-                  alarmStatus = onCheckAlarm()
-                  callsList = onCheckCalls()
-                  notificationsText = onGetNotifications()
+              var alarmState by remember { mutableStateOf(Pair(true, "Yükleniyor...")) }
+              var callsList by remember { mutableStateOf<List<CallInfo>>(emptyList()) }
+              var notificationsList by remember { mutableStateOf<List<NotificationItem>>(emptyList()) }
+
+              fun refreshAll() {
+                  alarmState = onRefreshAlarms()
+                  callsList = onRefreshCalls()
+                  notificationsList = onRefreshNotifications()
               }
 
-              Column(
-                  modifier = Modifier
-                      .fillMaxSize()
-                      .padding(16.dp)
-                      .verticalScroll(rememberScrollState())
-              ) {
-                  Text("🤖 Kişisel Asistanınız", style = MaterialTheme.typography.headlineMedium)
-                  Spacer(modifier = Modifier.height(16.dp))
+              LaunchedEffect(Unit) {
+                  refreshAll()
+              }
 
-                  Card(modifier = Modifier.fillMaxWidth()) {
-                      Column(modifier = Modifier.padding(12.dp)) {
-                          Text("⏰ Alarm Durumu", style = MaterialTheme.typography.titleMedium)
-                          Text(alarmStatus)
+              Scaffold(
+                  bottomBar = {
+                      NavigationBar {
+                          tabs.forEachIndexed { index, title ->
+                              NavigationBarItem(
+                                  selected = selectedTab == index,
+                                  onClick = { selectedTab = index },
+                                  label = { Text(title) },
+                                  icon = { }
+                              )
+                          }
+                      }
+                  },
+                  floatingActionButton = {
+                      ExtendedFloatingActionButton(
+                          onClick = { refreshAll() },
+                          text = { Text("🔄 Yenile") },
+                          icon = { }
+                      )
+                  }
+              ) { padding ->
+                  Box(modifier = Modifier.padding(padding).fillMaxSize()) {
+                      when (selectedTab) {
+                          0 -> SummaryScreen(alarmState, callsList, notificationsList, onTabSelect = { selectedTab = it })
+                          1 -> CallsScreen(callsList, onCallNumber, onRequestPermissions)
+                          2 -> NotificationsScreen(notificationsList, onOpenNotificationSettings)
+                          3 -> SettingsScreen(onClearData = {
+                              onClearData()
+                              refreshAll()
+                          }, onOpenNotificationSettings, onRequestPermissions)
                       }
                   }
+              }
+          }
 
-                  Spacer(modifier = Modifier.height(12.dp))
+          @Composable
+          fun SummaryScreen(
+              alarmState: Pair<Boolean, String>,
+              callsList: List<CallInfo>,
+              notificationsList: List<NotificationItem>,
+              onTabSelect: (Int) -> Unit
+          ) {
+              LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                  item {
+                      Text("👋 Merhaba, Günlük Durumun", style = MaterialTheme.typography.headlineMedium)
+                      Spacer(modifier = Modifier.height(16.dp))
+                  }
 
-                  Card(modifier = Modifier.fillMaxWidth()) {
-                      Column(modifier = Modifier.padding(12.dp)) {
-                          Text("📞 Cevapsız / Dönüş Bekleyenler", style = MaterialTheme.typography.titleMedium)
-                          callsList.forEach { call ->
-                              Text("• $call", style = MaterialTheme.typography.bodyMedium)
+                  item {
+                      Card(
+                          colors = CardDefaults.cardColors(
+                              containerColor = if (alarmState.first) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer
+                          ),
+                          modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)
+                      ) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Text("⏰ Alarm Kontrolü", style = MaterialTheme.typography.titleMedium)
+                              Spacer(modifier = Modifier.height(4.dp))
+                              Text(alarmState.second, style = MaterialTheme.typography.bodyMedium)
                           }
                       }
                   }
 
-                  Spacer(modifier = Modifier.height(12.dp))
-
-                  Card(modifier = Modifier.fillMaxWidth()) {
-                      Column(modifier = Modifier.padding(12.dp)) {
-                          Text("✉️ Mail & Mesaj Bildirimleri", style = MaterialTheme.typography.titleMedium)
-                          Text(notificationsText, style = MaterialTheme.typography.bodySmall)
+                  item {
+                      Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Text("📞 Cevapsız Aramalar (${callsList.size})", style = MaterialTheme.typography.titleMedium)
+                              Spacer(modifier = Modifier.height(4.dp))
+                              if (callsList.isEmpty()) {
+                                  Text("Harika! Dönüş yapılmamış cevapsız arama yok.")
+                              } else {
+                                  Text("İlgilenmen gereken ${callsList.size} cevapsız arama var.")
+                                  Button(onClick = { onTabSelect(1) }, modifier = Modifier.padding(top = 8.dp)) {
+                                      Text("Aramaları Gör")
+                                  }
+                              }
+                          }
                       }
                   }
 
-                  Spacer(modifier = Modifier.height(20.dp))
-
-                  Button(
-                      onClick = onOpenNotificationSettings,
-                      modifier = Modifier.fillMaxWidth()
-                  ) {
-                      Text("Mail/Mesaj Dinleme İznini Aç")
+                  item {
+                      Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Text("✉️ Son Mesaj & Mailler (${notificationsList.size})", style = MaterialTheme.typography.titleMedium)
+                              Spacer(modifier = Modifier.height(4.dp))
+                              if (notificationsList.isEmpty()) {
+                                  Text("Henüz yakalanmış bir bildirim bulunmuyor.")
+                              } else {
+                                  Text("Toplam ${notificationsList.size} adet mail/mesaj kaydedildi.")
+                                  Button(onClick = { onTabSelect(2) }, modifier = Modifier.padding(top = 8.dp)) {
+                                      Text("Mesajları İncele")
+                                  }
+                              }
+                          }
+                      }
                   }
+              }
+          }
 
-                  Spacer(modifier = Modifier.height(8.dp))
+          @Composable
+          fun CallsScreen(callsList: List<CallInfo>, onCallNumber: (String) -> Unit, onRequestPermissions: () -> Unit) {
+              LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                  item {
+                      Text("📞 Cevapsız & Dönüş Bekleyenler", style = MaterialTheme.typography.headlineSmall)
+                      Spacer(modifier = Modifier.height(8.dp))
+                      if (callsList.isEmpty()) {
+                          Text("Arama kaydı bulunamadı veya izin eksik.")
+                          Button(onClick = onRequestPermissions, modifier = Modifier.padding(top = 8.dp)) {
+                              Text("Arama İznini Yenile")
+                          }
+                          Spacer(modifier = Modifier.height(16.dp))
+                      }
+                  }
+                  items(callsList) { call ->
+                      Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                          Row(
+                              modifier = Modifier.fillMaxWidth().padding(12.dp),
+                              horizontalArrangement = Arrangement.SpaceBetween,
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Column(modifier = Modifier.weight(1f)) {
+                                  Text(call.name, style = MaterialTheme.typography.titleMedium)
+                                  Text(call.number, style = MaterialTheme.typography.bodySmall)
+                              }
+                              Button(onClick = { onCallNumber(call.number) }) {
+                                  Text("Geri Ara")
+                              }
+                          }
+                      }
+                  }
+              }
+          }
 
-                  Button(
-                      onClick = {
-                          onClearData()
-                          notificationsText = "Tüm veriler başarıyla silindi."
-                      },
-                      colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                      modifier = Modifier.fillMaxWidth()
-                  ) {
-                      Text("Tüm Verileri Temizle (Sıfırla)")
+          @Composable
+          fun NotificationsScreen(notificationsList: List<NotificationItem>, onOpenNotificationSettings: () -> Unit) {
+              LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                  item {
+                      Row(
+                          modifier = Modifier.fillMaxWidth(),
+                          horizontalArrangement = Arrangement.SpaceBetween,
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Text("✉️ Mail ve Mesajlar", style = MaterialTheme.typography.headlineSmall)
+                          OutlinedButton(onClick = onOpenNotificationSettings) {
+                              Text("İzin Ayarı")
+                          }
+                      }
+                      Spacer(modifier = Modifier.height(8.dp))
+                      if (notificationsList.isEmpty()) {
+                          Text("Henüz yakalanan bildirim yok. Mail veya WhatsApp bildirimi geldiğinde otomatik buraya eklenecektir.")
+                      }
+                  }
+                  items(notificationsList) { item ->
+                      Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                          Column(modifier = Modifier.padding(12.dp)) {
+                              Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                                  Text(item.type, style = MaterialTheme.typography.labelMedium)
+                                  Text(item.time, style = MaterialTheme.typography.labelSmall)
+                              }
+                              Text(item.title, style = MaterialTheme.typography.titleMedium)
+                              Text(item.text, style = MaterialTheme.typography.bodyMedium)
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun SettingsScreen(onClearData: () -> Unit, onOpenNotificationSettings: () -> Unit, onRequestPermissions: () -> Unit) {
+              LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                  item {
+                      Text("⚙️ Ayarlar & İzinler", style = MaterialTheme.typography.headlineSmall)
+                      Spacer(modifier = Modifier.height(16.dp))
+                  }
+                  item {
+                      Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Text("🔐 Sistem İzinleri", style = MaterialTheme.typography.titleMedium)
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Button(onClick = onRequestPermissions, modifier = Modifier.fillMaxWidth()) {
+                                  Text("Arama ve SMS İzinlerini İste")
+                              }
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Button(onClick = onOpenNotificationSettings, modifier = Modifier.fillMaxWidth()) {
+                                  Text("Bildirim Dinleme İznini Aç")
+                              }
+                          }
+                      }
+                  }
+                  item {
+                      Card(
+                          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                          modifier = Modifier.fillMaxWidth()
+                      ) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Text("🗑️ Gizlilik ve Veri Sıfırlama", style = MaterialTheme.typography.titleMedium)
+                              Text("Uygulamanın telefonunuzda sakladığı tüm verileri anında kalıcı olarak siler.", style = MaterialTheme.typography.bodySmall)
+                              Spacer(modifier = Modifier.height(12.dp))
+                              Button(
+                                  onClick = onClearData,
+                                  colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                  modifier = Modifier.fillMaxWidth()
+                              ) {
+                                  Text("Tüm Verileri Şimdi Sıfırla")
+                              }
+                          }
+                      }
                   }
               }
           }
