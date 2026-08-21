@@ -72,8 +72,8 @@ jobs:
                   applicationId = "com.asistan.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 6
-                  versionName = "6.0-Full-Mail-AI"
+                  versionCode = 7
+                  versionName = "7.0-Calls-Fixed"
               }
 
               compileOptions {
@@ -111,8 +111,6 @@ jobs:
               implementation("androidx.compose.material3:material3")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
               implementation("androidx.work:work-runtime-ktx:2.9.0")
-              
-              // Tam E-Posta ve Ek Okuma Kütüphanesi (JavaMail)
               implementation("com.sun.mail:android-mail:1.6.7")
               implementation("com.sun.mail:android-activation:1.6.7")
           }
@@ -125,6 +123,8 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.READ_CALL_LOG" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
               <uses-permission android:name="android.permission.READ_SMS" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.READ_CALENDAR" />
@@ -241,16 +241,15 @@ jobs:
           import java.net.URL
           import java.text.SimpleDateFormat
           import java.util.Calendar
+          import java.util.Date
           import java.util.Locale
           import java.util.Properties
-          import javax.mail.BodyPart
           import javax.mail.Folder
           import javax.mail.Multipart
           import javax.mail.Part
           import javax.mail.Session
-          import javax.mail.internet.MimeMessage
 
-          data class CallInfo(val name: String, val number: String, val date: String)
+          data class CallInfo(val name: String, val number: String, val type: String, val date: String, val isMissed: Boolean)
           data class NotificationItem(val time: String, val type: String, val title: String, val text: String)
           data class FullEmailItem(val sender: String, val subject: String, val body: String, val attachments: List<String>, val date: String)
           data class ChatMessage(val sender: String, val text: String)
@@ -283,13 +282,19 @@ jobs:
                           Surface(modifier = Modifier.fillMaxSize()) {
                               MainAssistantApp(
                                   onRefreshAlarms = { checkAlarmStatus() },
-                                  onRefreshCalls = { getUnreturnedCalls() },
+                                  onRefreshCalls = { getRecentCalls() },
                                   onRefreshNotifications = { getStoredNotifications() },
                                   onFetchEmails = { fetchFullEmails() },
                                   onCallNumber = { num ->
                                       startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num")))
                                   },
                                   onRequestPermissions = { requestAppPermissions() },
+                                  onOpenAppSettings = {
+                                      val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                          data = Uri.fromParts("package", packageName, null)
+                                      }
+                                      startActivity(intent)
+                                  },
                                   onOpenNotificationSettings = {
                                       startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                                   },
@@ -356,6 +361,8 @@ jobs:
                   permissionLauncher.launch(
                       arrayOf(
                           Manifest.permission.READ_CALL_LOG,
+                          Manifest.permission.READ_PHONE_STATE,
+                          Manifest.permission.READ_CONTACTS,
                           Manifest.permission.READ_SMS,
                           Manifest.permission.RECORD_AUDIO,
                           Manifest.permission.POST_NOTIFICATIONS,
@@ -381,7 +388,7 @@ jobs:
                   }
               }
 
-              private fun getUnreturnedCalls(): List<CallInfo> {
+              private fun getRecentCalls(): List<CallInfo> {
                   val list = mutableListOf<CallInfo>()
                   if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
                       return emptyList()
@@ -389,20 +396,40 @@ jobs:
                   try {
                       val cursor = contentResolver.query(
                           CallLog.Calls.CONTENT_URI,
-                          arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.CACHED_NAME, CallLog.Calls.DATE),
-                          null, null, "${CallLog.Calls.DATE} DESC LIMIT 30"
+                          null,
+                          null,
+                          null,
+                          CallLog.Calls.DATE + " DESC"
                       )
                       cursor?.use {
-                          while (it.moveToNext()) {
-                              val type = it.getInt(it.getColumnIndexOrThrow(CallLog.Calls.TYPE))
-                              val number = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.NUMBER)) ?: "Bilinmeyen"
-                              val name = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)) ?: number
-                              if (type == CallLog.Calls.MISSED_TYPE) {
-                                  list.add(CallInfo(name, number, "Cevapsız"))
+                          val numberIdx = it.getColumnIndex(CallLog.Calls.NUMBER)
+                          val typeIdx = it.getColumnIndex(CallLog.Calls.TYPE)
+                          val nameIdx = it.getColumnIndex(CallLog.Calls.CACHED_NAME)
+                          val dateIdx = it.getColumnIndex(CallLog.Calls.DATE)
+
+                          var count = 0
+                          while (it.moveToNext() && count < 30) {
+                              val number = if (numberIdx != -1) it.getString(numberIdx) ?: "Bilinmeyen" else "Bilinmeyen"
+                              val name = if (nameIdx != -1) it.getString(nameIdx) ?: number else number
+                              val typeInt = if (typeIdx != -1) it.getInt(typeIdx) else CallLog.Calls.INCOMING_TYPE
+                              val rawDate = if (dateIdx != -1) it.getLong(dateIdx) else 0L
+                              val formattedDate = SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()).format(Date(rawDate))
+
+                              val (typeStr, isMissed) = when (typeInt) {
+                                  CallLog.Calls.MISSED_TYPE -> Pair("📞 Cevapsız", true)
+                                  CallLog.Calls.REJECTED_TYPE -> Pair("🚫 Reddedilen", true)
+                                  CallLog.Calls.INCOMING_TYPE -> Pair("📥 Gelen Arama", false)
+                                  CallLog.Calls.OUTGOING_TYPE -> Pair("📤 Giden Arama", false)
+                                  else -> Pair("Arama", false)
                               }
+
+                              list.add(CallInfo(name, number, typeStr, formattedDate, isMissed))
+                              count++
                           }
                       }
-                  } catch (_: Exception) {}
+                  } catch (e: Exception) {
+                      list.add(CallInfo("Hata", e.message ?: "Arama hatası", "Hata", "", false))
+                  }
                   return list
               }
 
@@ -589,6 +616,7 @@ jobs:
               onFetchEmails: suspend () -> List<FullEmailItem>,
               onCallNumber: (String) -> Unit,
               onRequestPermissions: () -> Unit,
+              onOpenAppSettings: () -> Unit,
               onOpenNotificationSettings: () -> Unit,
               onClearData: () -> Unit,
               getApiKey: () -> String,
@@ -653,11 +681,11 @@ jobs:
                           2 -> EmailsScreen(emailsList, onFetchEmails = {
                               scope.launch { emailsList = onFetchEmails() }
                           }, callGemini, onCopyToClipboard)
-                          3 -> CallsScreen(callsList, onCallNumber, onRequestPermissions)
+                          3 -> CallsScreen(callsList, onCallNumber, onRequestPermissions, onOpenAppSettings)
                           4 -> SettingsScreen(getApiKey, saveApiKey, getEmailConfig, saveEmailConfig, onClearData = {
                               onClearData()
                               refreshAll()
-                          }, onOpenNotificationSettings, onRequestPermissions)
+                          }, onOpenNotificationSettings, onRequestPermissions, onOpenAppSettings)
                       }
                   }
               }
@@ -675,7 +703,7 @@ jobs:
               onStopSpeaking: () -> Unit,
               onAddToCalendar: (String, String) -> Unit
           ) {
-              var aiSummary by remember { mutableStateOf("Tüm e-postalarınızı, ekli dosyaları ve cevapsız aramaları yapay zekayla analiz etmek için aşağıdaki butona basın.") }
+              var aiSummary by remember { mutableStateOf("Tüm e-postalarınızı, ekli dosyaları ve aramaları analiz etmek için aşağıdaki butona basın.") }
               var isLoading by remember { mutableStateOf(false) }
               var isSpeaking by remember { mutableStateOf(false) }
               val scope = rememberCoroutineScope()
@@ -684,7 +712,8 @@ jobs:
                   scope.launch {
                       isLoading = true
                       onRefresh()
-                      val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number})" }
+                      val missedCalls = callsList.filter { it.isMissed }
+                      val callsText = missedCalls.joinToString("\n") { "- ${it.name} (${it.number}) [${it.date}]" }
                       val emailsText = emailsList.joinToString("\n---\n") {
                           "GÖNDEREN: ${it.sender}\nKONU: ${it.subject}\nEKLER: ${it.attachments.joinToString()}\nİÇERİK: ${it.body}"
                       }
@@ -700,10 +729,10 @@ jobs:
                           $emailsText
                           
                           GÖREVİN:
-                          1. Kullanıcıya samimi ve profesyonel bir günlük yönetici özeti (Executive Briefing) sun.
-                          2. Maillerdeki ekli dosyaları (teklif, fatura vb.) ve acil cevaplanması gerekenleri özel olarak belirt.
+                          1. Samimi ve profesyonel bir günlük yönetici özeti sun.
+                          2. Varsa acil dönülmesi gereken aramaları ve mail eklerini (fatura, teklif) belirt.
                           3. Hafta içi alarmı yoksa uyar.
-                          4. Madde madde yapılacaklar listesi sun.
+                          4. Madde madde yapılacaklar listesi ver.
                       """.trimIndent()
 
                       aiSummary = callGemini(prompt)
@@ -713,7 +742,7 @@ jobs:
 
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Text("🧠 AI Tam Kapsamlı Yönetici Brifingi", style = MaterialTheme.typography.headlineSmall)
+                      Text("🧠 AI Yönetici Brifingi", style = MaterialTheme.typography.headlineSmall)
                       Spacer(modifier = Modifier.height(12.dp))
                   }
                   item {
@@ -725,9 +754,9 @@ jobs:
                           if (isLoading) {
                               CircularProgressIndicator(color = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(20.dp))
                               Spacer(modifier = Modifier.width(8.dp))
-                              Text("Mailler ve Ekler Taranıyor...")
+                              Text("Analiz Ediliyor...")
                           } else {
-                              Text("✨ Mailleri & Durumu Derinlemesine Analiz Et")
+                              Text("✨ Günlük Durumu Analiz Et")
                           }
                       }
                       Spacer(modifier = Modifier.height(16.dp))
@@ -768,6 +797,76 @@ jobs:
           }
 
           @Composable
+          fun CallsScreen(
+              callsList: List<CallInfo>,
+              onCallNumber: (String) -> Unit,
+              onRequestPermissions: () -> Unit,
+              onOpenAppSettings: () -> Unit
+          ) {
+              var showOnlyMissed by remember { mutableStateOf(false) }
+              val filteredList = if (showOnlyMissed) callsList.filter { it.isMissed } else callsList
+
+              LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                  item {
+                      Text("📞 Arama Geçmişi (${callsList.size})", style = MaterialTheme.typography.headlineSmall)
+                      Spacer(modifier = Modifier.height(8.dp))
+                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          FilterChip(
+                              selected = !showOnlyMissed,
+                              onClick = { showOnlyMissed = false },
+                              label = { Text("Tüm Aramalar") }
+                          )
+                          FilterChip(
+                              selected = showOnlyMissed,
+                              onClick = { showOnlyMissed = true },
+                              label = { Text("Sadece Cevapsızlar") }
+                          )
+                      }
+                      Spacer(modifier = Modifier.height(8.dp))
+
+                      if (callsList.isEmpty()) {
+                          Card(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                              Column(modifier = Modifier.padding(16.dp)) {
+                                  Text("Arama kaydı okunamadı. Telefon izinlerini kontrol edin:")
+                                  Spacer(modifier = Modifier.height(8.dp))
+                                  Button(onClick = onRequestPermissions, modifier = Modifier.fillMaxWidth()) {
+                                      Text("İzin İste")
+                                  }
+                                  Spacer(modifier = Modifier.height(4.dp))
+                                  OutlinedButton(onClick = onOpenAppSettings, modifier = Modifier.fillMaxWidth()) {
+                                      Text("Ayarlar'da İzinleri Aç")
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  items(filteredList) { call ->
+                      Card(
+                          colors = CardDefaults.cardColors(
+                              containerColor = if (call.isMissed) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surfaceVariant
+                          ),
+                          modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                      ) {
+                          Row(
+                              modifier = Modifier.fillMaxWidth().padding(12.dp),
+                              horizontalArrangement = Arrangement.SpaceBetween,
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Column(modifier = Modifier.weight(1f)) {
+                                  Text(call.name, style = MaterialTheme.typography.titleMedium)
+                                  Text("${call.type} • ${call.date}", style = MaterialTheme.typography.bodySmall)
+                                  Text(call.number, style = MaterialTheme.typography.labelSmall)
+                              }
+                              Button(onClick = { onCallNumber(call.number) }) {
+                                  Text("Ara")
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
           fun EmailsScreen(
               emailsList: List<FullEmailItem>,
               onFetchEmails: () -> Unit,
@@ -781,7 +880,7 @@ jobs:
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
                       Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                          Text("📨 Gelen E-Postalar & Ekler", style = MaterialTheme.typography.headlineSmall)
+                          Text("📨 Gelen E-Postalar", style = MaterialTheme.typography.headlineSmall)
                           Button(onClick = onFetchEmails) {
                               Text("🔄 Çek")
                           }
@@ -853,7 +952,7 @@ jobs:
               callGemini: suspend (String) -> String,
               onStartVoiceInput: (((String) -> Unit)) -> Unit
           ) {
-              val messages = remember { mutableStateListOf(ChatMessage("asistan", "Merhaba! Tüm maillerinizi, ekli dosyalarınızı ve cevapsız aramalarınızı biliyorum. İstediğinizi sorabilirsiniz.")) }
+              val messages = remember { mutableStateListOf(ChatMessage("asistan", "Merhaba! Mailleriniz, ekli dosyalarınız ve aramalarınız hakkında bana istediğinizi sorabilirsiniz.")) }
               var userInput by remember { mutableStateOf("") }
               var isTyping by remember { mutableStateOf(false) }
               val scope = rememberCoroutineScope()
@@ -865,13 +964,13 @@ jobs:
                       isTyping = true
 
                       scope.launch {
-                          val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number})" }
-                          val emailsText = emailsList.joinToString("\n") { "Mail: ${it.sender} - ${it.subject} | Ekler: ${it.attachments.joinToString()} | İçerik: ${it.body.take(300)}" }
+                          val callsText = callsList.joinToString("\n") { "- ${it.name} (${it.number}) [${it.type}]" }
+                          val emailsText = emailsList.joinToString("\n") { "Mail: ${it.sender} - ${it.subject} | Ekler: ${it.attachments.joinToString()}" }
                           val fullPrompt = """
                               Sen kullanıcının cep telefonundaki akıllı kişisel sekreterisin.
                               Telefon verileri:
                               ALARM: ${alarmState.second}
-                              CEVAPSIZ ARAMALAR:
+                              ARAMALAR:
                               $callsText
                               MAİLLER VE EKLERİ:
                               $emailsText
@@ -946,40 +1045,6 @@ jobs:
           }
 
           @Composable
-          fun CallsScreen(callsList: List<CallInfo>, onCallNumber: (String) -> Unit, onRequestPermissions: () -> Unit) {
-              LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                  item {
-                      Text("📞 Cevapsız Aramalar (${callsList.size})", style = MaterialTheme.typography.headlineSmall)
-                      Spacer(modifier = Modifier.height(8.dp))
-                      if (callsList.isEmpty()) {
-                          Text("Cevapsız arama kaydı yok veya arama izni verilmedi.")
-                          Button(onClick = onRequestPermissions, modifier = Modifier.padding(top = 8.dp)) {
-                              Text("Arama İznini Yenile")
-                          }
-                          Spacer(modifier = Modifier.height(16.dp))
-                      }
-                  }
-                  items(callsList) { call ->
-                      Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                          Row(
-                              modifier = Modifier.fillMaxWidth().padding(12.dp),
-                              horizontalArrangement = Arrangement.SpaceBetween,
-                              verticalAlignment = Alignment.CenterVertically
-                          ) {
-                              Column(modifier = Modifier.weight(1f)) {
-                                  Text(call.name, style = MaterialTheme.typography.titleMedium)
-                                  Text(call.number, style = MaterialTheme.typography.bodySmall)
-                              }
-                              Button(onClick = { onCallNumber(call.number) }) {
-                                  Text("Ara")
-                              }
-                          }
-                      }
-                  }
-              }
-          }
-
-          @Composable
           fun SettingsScreen(
               getApiKey: () -> String,
               saveApiKey: (String) -> Unit,
@@ -987,7 +1052,8 @@ jobs:
               saveEmailConfig: (String, String) -> Unit,
               onClearData: () -> Unit,
               onOpenNotificationSettings: () -> Unit,
-              onRequestPermissions: () -> Unit
+              onRequestPermissions: () -> Unit,
+              onOpenAppSettings: () -> Unit
           ) {
               var keyInput by remember { mutableStateOf(getApiKey()) }
               var isApiKeySaved by remember { mutableStateOf(false) }
@@ -999,7 +1065,7 @@ jobs:
 
               LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                   item {
-                      Text("⚙️ Ayarlar & E-Posta Entegrasyonu", style = MaterialTheme.typography.headlineSmall)
+                      Text("⚙️ Ayarlar & Yapay Zeka", style = MaterialTheme.typography.headlineSmall)
                       Spacer(modifier = Modifier.height(16.dp))
                   }
                   item {
@@ -1007,7 +1073,7 @@ jobs:
                           Column(modifier = Modifier.padding(16.dp)) {
                               Text("✉️ E-Posta Hesabı (Tam Okuma)", style = MaterialTheme.typography.titleMedium)
                               Spacer(modifier = Modifier.height(4.dp))
-                              Text("Maillerin tümünü ve PDF/Excel eklerini okumak için posta adresinizi ve Uygulama Şifrenizi girin.", style = MaterialTheme.typography.bodySmall)
+                              Text("Mailleri ve PDF/Excel eklerini okumak için adresinizi ve Uygulama Şifrenizi girin.", style = MaterialTheme.typography.bodySmall)
                               Spacer(modifier = Modifier.height(8.dp))
                               TextField(
                                   value = emailInput,
@@ -1060,6 +1126,25 @@ jobs:
                       }
                   }
                   item {
+                      Card(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Text("🔐 Sistem İzinleri", style = MaterialTheme.typography.titleMedium)
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Button(onClick = onRequestPermissions, modifier = Modifier.fillMaxWidth()) {
+                                  Text("Tüm İzinleri İste")
+                              }
+                              Spacer(modifier = Modifier.height(4.dp))
+                              OutlinedButton(onClick = onOpenAppSettings, modifier = Modifier.fillMaxWidth()) {
+                                  Text("Uygulama İzin Ayarlarını Aç")
+                              }
+                              Spacer(modifier = Modifier.height(4.dp))
+                              OutlinedButton(onClick = onOpenNotificationSettings, modifier = Modifier.fillMaxWidth()) {
+                                  Text("Bildirim Dinleme İznini Aç")
+                              }
+                          }
+                      }
+                  }
+                  item {
                       Card(
                           colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                           modifier = Modifier.fillMaxWidth()
@@ -1072,7 +1157,7 @@ jobs:
                                   colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                                   modifier = Modifier.fillMaxWidth()
                               ) {
-                                  Text("Tüm Verileri, Mailleri ve Sohbeti Sil")
+                                  Text("Tüm Verileri Sıfırla")
                               }
                           }
                       }
