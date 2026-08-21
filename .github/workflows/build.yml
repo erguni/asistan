@@ -239,4 +239,138 @@ jobs:
               }
 
               private fun getUnreturnedCalls(): List<String> {
-                  val unreturned = mutableListOf<Str
+                  val unreturned = mutableListOf<String>()
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+                      return listOf("Arama günlüğü izni verilmedi.")
+                  }
+                  try {
+                      val cursor = contentResolver.query(
+                          CallLog.Calls.CONTENT_URI,
+                          arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.CACHED_NAME),
+                          null, null, "${CallLog.Calls.DATE} DESC LIMIT 20"
+                      )
+                      cursor?.use {
+                          while (it.moveToNext()) {
+                              val type = it.getInt(it.getColumnIndexOrThrow(CallLog.Calls.TYPE))
+                              val number = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.NUMBER))
+                              val name = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)) ?: number
+
+                              if (type == CallLog.Calls.MISSED_TYPE) {
+                                  unreturned.add("Cevapsız Arama: $name ($number)")
+                              }
+                          }
+                      }
+                  } catch (e: Exception) {
+                      unreturned.add("Aramalar taranırken hata: ${e.message}")
+                  }
+                  return if (unreturned.isEmpty()) listOf("Dönüş yapılmamış cevapsız arama yok.") else unreturned
+              }
+
+              private fun getStoredNotifications(): String {
+                  val prefs = getSharedPreferences("asistan_veriler", MODE_PRIVATE)
+                  return prefs.getString("bildirimler", "Henüz yakalanan mail veya mesaj bildirimi yok.") ?: ""
+              }
+
+              private fun clearAllData() {
+                  val prefs = getSharedPreferences("asistan_veriler", MODE_PRIVATE)
+                  prefs.edit().clear().apply()
+              }
+          }
+
+          @Composable
+          fun AssistantScreen(
+              onCheckAlarm: () -> String,
+              onCheckCalls: () -> List<String>,
+              onGetNotifications: () -> String,
+              onClearData: () -> Unit,
+              onOpenNotificationSettings: () -> Unit
+          ) {
+              var alarmStatus by remember { mutableStateOf("") }
+              var callsList by remember { mutableStateOf<List<String>>(emptyList()) }
+              var notificationsText by remember { mutableStateOf("") }
+
+              LaunchedEffect(Unit) {
+                  alarmStatus = onCheckAlarm()
+                  callsList = onCheckCalls()
+                  notificationsText = onGetNotifications()
+              }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .padding(16.dp)
+                      .verticalScroll(rememberScrollState())
+              ) {
+                  Text("🤖 Kişisel Asistanınız", style = MaterialTheme.typography.headlineMedium)
+                  Spacer(modifier = Modifier.height(16.dp))
+
+                  Card(modifier = Modifier.fillMaxWidth()) {
+                      Column(modifier = Modifier.padding(12.dp)) {
+                          Text("⏰ Alarm Durumu", style = MaterialTheme.typography.titleMedium)
+                          Text(alarmStatus)
+                      }
+                  }
+
+                  Spacer(modifier = Modifier.height(12.dp))
+
+                  Card(modifier = Modifier.fillMaxWidth()) {
+                      Column(modifier = Modifier.padding(12.dp)) {
+                          Text("📞 Cevapsız / Dönüş Bekleyenler", style = MaterialTheme.typography.titleMedium)
+                          callsList.forEach { call ->
+                              Text("• $call", style = MaterialTheme.typography.bodyMedium)
+                          }
+                      }
+                  }
+
+                  Spacer(modifier = Modifier.height(12.dp))
+
+                  Card(modifier = Modifier.fillMaxWidth()) {
+                      Column(modifier = Modifier.padding(12.dp)) {
+                          Text("✉️ Mail & Mesaj Bildirimleri", style = MaterialTheme.typography.titleMedium)
+                          Text(notificationsText, style = MaterialTheme.typography.bodySmall)
+                      }
+                  }
+
+                  Spacer(modifier = Modifier.height(20.dp))
+
+                  Button(
+                      onClick = onOpenNotificationSettings,
+                      modifier = Modifier.fillMaxWidth()
+                  ) {
+                      Text("Mail/Mesaj Dinleme İznini Aç")
+                  }
+
+                  Spacer(modifier = Modifier.height(8.dp))
+
+                  Button(
+                      onClick = {
+                          onClearData()
+                          notificationsText = "Tüm veriler başarıyla silindi."
+                      },
+                      colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                      modifier = Modifier.fillMaxWidth()
+                  ) {
+                      Text("Tüm Verileri Temizle (Sıfırla)")
+                  }
+              }
+          }
+          EOF
+
+      - name: Gradle Kur
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Android SDK ve Lisanslari Onayla
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: APK Derle
+        run: gradle assembleDebug --stacktrace
+
+      - name: APK'yi Indirilebilir Yap
+        uses: actions/upload-artifact@v4
+        with:
+          name: Asistan-APK
+          path: app/build/outputs/apk/debug/*.apk
